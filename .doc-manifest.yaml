@@ -1,0 +1,29 @@
+version: 1
+last_synced: "2026-02-15T16:10:00Z"
+documents:
+  - path: README.md
+    type: overview
+    references:
+      - Cargo.toml
+      - src/config.rs
+      - src/app.rs
+      - src/audio.rs
+  - path: docs/USAGE.md
+    type: usage
+    references:
+      - src/config.rs
+      - src/app.rs
+      - src/audio.rs
+  - path: docs/ARCHITECTURE.md
+    type: architecture
+    references:
+      - src/app.rs
+      - src/audio.rs
+      - src/render/mod.rs
+      - src/visual/mod.rs
+  - path: docs/testing.md
+    type: testing
+    references:
+      - src/bin/benchmark.rs
+      - src/bin/gen_test_audio.rs
+      - src/bin/latency_report.rs
