@@ -24,6 +24,19 @@ You must grant Screen Recording permission to your terminal app in:
 
 ## Quick start
 
+Install released binary (Homebrew tap, macOS Apple Silicon):
+
+```sh
+brew tap gradigit/tap
+brew install brotviz
+```
+
+Run installed binary:
+
+```sh
+brotviz --source mic --engine metal --renderer half-block
+```
+
 List input devices:
 
 ```sh

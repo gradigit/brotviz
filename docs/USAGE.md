@@ -2,6 +2,19 @@
 
 ## Basic commands
 
+Homebrew install (released binary, macOS Apple Silicon):
+
+```sh
+brew tap gradigit/tap
+brew install brotviz
+```
+
+Run installed binary:
+
+```sh
+brotviz --source mic --engine metal --renderer half-block
+```
+
 Mic input:
 
 ```sh
