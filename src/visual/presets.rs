@@ -398,6 +398,46 @@ pub fn make_presets() -> Vec<Box<dyn Preset>> {
         Neon,
         Feedback::tunnel(0.90, 0.022, 1.15),
     )));
+    v.push(Box::new(FieldPreset::new(
+        "Hopalong Attractor: Neon Dust",
+        Hopalong {
+            a: 1.42,
+            b: -2.19,
+            c: 0.73,
+        },
+        Neon,
+        Feedback::tunnel(0.92, 0.020, 1.16),
+    )));
+    v.push(Box::new(FieldPreset::new(
+        "Ikeda Loop: Bass Cyclone",
+        Ikeda { u: 0.89 },
+        Cosmic,
+        Feedback::tunnel(0.91, 0.021, 1.14),
+    )));
+    v.push(Box::new(FieldPreset::new(
+        "Hex Tunnel: Lattice Drive",
+        HexTunnel { freq: 6.2 },
+        Prism,
+        Feedback::tunnel(0.90, 0.020, 1.22),
+    )));
+    v.push(Box::new(FieldPreset::new(
+        "Gyroid Slice: Reactor Core",
+        Gyroid { freq: 4.0 },
+        Aurora,
+        Feedback::tunnel(0.92, 0.018, 1.08),
+    )));
+    v.push(Box::new(FieldPreset::new(
+        "Phyllotaxis Bloom: Harmonic Seeds",
+        Phyllotaxis { petals: 96 },
+        Fire,
+        Feedback::tunnel(0.92, 0.020, 1.10),
+    )));
+    v.push(Box::new(FieldPreset::new(
+        "Nova Fractal: Root Resonance",
+        Nova { c: (-0.42, 0.23) },
+        Acid,
+        Feedback::tunnel(0.91, 0.020, 1.18),
+    )));
 
     v
 }
@@ -444,6 +484,12 @@ enum Algo {
     Chladni { a: f32, b: f32 },
     Crt { freq: f32 },
     Moire { freq: f32 },
+    Hopalong { a: f32, b: f32, c: f32 },
+    Ikeda { u: f32 },
+    HexTunnel { freq: f32 },
+    Gyroid { freq: f32 },
+    Phyllotaxis { petals: u32 },
+    Nova { c: (f32, f32) },
 }
 
 #[derive(Clone, Copy)]
@@ -506,19 +552,20 @@ impl Preset for FieldPreset {
         let w = ctx.w.max(1);
         let h = ctx.h.max(1);
         let scale = ctx.scale.max(1);
+        let frame_len = w.saturating_mul(h).saturating_mul(4);
+        if out.len() < frame_len {
+            return;
+        }
 
-        let bass = ctx.audio.bands[1];
-        let mid = ctx.audio.bands[3];
-        let treb = ctx.audio.bands[6];
-        let energy = ctx.audio.rms;
+        let route = RouteMap::from_ctx(ctx);
+        let bass = route.bass;
+        let mid = route.mid;
+        let treb = route.treb;
+        let onset = route.onset;
+        let energy = route.energy;
+        let beat_pulse = route.beat;
 
-        let beat_pulse = if ctx.safe {
-            (ctx.beat_pulse * 0.6).min(0.6)
-        } else {
-            ctx.beat_pulse
-        };
-
-        let zoom_mod = 1.0 - bass * 0.14 - beat_pulse * 0.08;
+        let zoom_mod = (1.0 - bass * 0.12 * route.zoom - beat_pulse * 0.08).clamp(0.25, 1.4);
         let t = ctx.t;
 
         // Fill in blocks to allow adaptive downscale without a second buffer.
@@ -563,8 +610,9 @@ impl Preset for FieldPreset {
                 let mut val = match self.algo {
                     Algo::Mandelbrot { center } => {
                         let (fx, fy) =
-                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse);
-                        let fz = fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, beat_pulse);
+                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
+                        let fz =
+                            fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
                         let zoom = 1.7 * zoom_mod * fz;
                         fractal_mandelbrot(
                             fx,
@@ -578,7 +626,7 @@ impl Preset for FieldPreset {
                     }
                     Algo::MandelDeep { center, orbit, speed } => {
                         let (fx, fy) =
-                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse);
+                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
                         fractal_mandelbrot_deep(
                             fx,
                             fy,
@@ -591,13 +639,17 @@ impl Preset for FieldPreset {
                             mid,
                             treb,
                             beat_pulse,
+                            onset,
+                            route.orbit,
+                            route.detail,
                             ctx.quality,
                         )
                     }
                     Algo::BurningShip { center } => {
                         let (fx, fy) =
-                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse);
-                        let fz = fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, beat_pulse);
+                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
+                        let fz =
+                            fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
                         let zoom = 1.55 * zoom_mod * fz;
                         fractal_burning_ship(
                             fx,
@@ -611,7 +663,7 @@ impl Preset for FieldPreset {
                     }
                     Algo::BurningShipDeep { center, speed } => {
                         let (fx, fy) =
-                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse);
+                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
                         fractal_burning_ship_deep(
                             fx,
                             fy,
@@ -623,13 +675,17 @@ impl Preset for FieldPreset {
                             mid,
                             treb,
                             beat_pulse,
+                            onset,
+                            route.orbit,
+                            route.detail,
                             ctx.quality,
                         )
                     }
                     Algo::OrbitTrap { center, trap } => {
                         let (fx, fy) =
-                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse);
-                        let fz = fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, beat_pulse);
+                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
+                        let fz =
+                            fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
                         let zoom = 1.55 * zoom_mod * fz;
                         fractal_orbit_trap(
                             fx,
@@ -645,8 +701,9 @@ impl Preset for FieldPreset {
                     }
                     Algo::Julia { c_base } => {
                         let (fx, fy) =
-                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse);
-                        let fz = fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, beat_pulse);
+                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
+                        let fz =
+                            fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
                         let zoom = 1.35 * zoom_mod * fz;
                         let cx = c_base.0 + 0.16 * (t * (0.17 + treb)).cos() + mid * 0.05;
                         let cy = c_base.1 + 0.14 * (t * (0.19 + bass)).sin() - treb * 0.04;
@@ -654,7 +711,7 @@ impl Preset for FieldPreset {
                     }
                     Algo::JuliaDeep { c_base, speed } => {
                         let (fx, fy) =
-                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse);
+                            fractal_motion_xy(sx, sy, t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
                         fractal_julia_deep(
                             fx,
                             fy,
@@ -666,6 +723,9 @@ impl Preset for FieldPreset {
                             mid,
                             treb,
                             beat_pulse,
+                            onset,
+                            route.orbit,
+                            route.detail,
                             ctx.quality,
                         )
                     }
@@ -692,6 +752,16 @@ impl Preset for FieldPreset {
                     Algo::Chladni { a, b } => chladni(sx, sy, t, a, b, bass, mid, treb),
                     Algo::Crt { freq } => crt_scan(sx, sy, t, freq, bass, mid, treb, beat_pulse, self.seed),
                     Algo::Moire { freq } => moire(sx, sy, t, freq, bass, treb, beat_pulse),
+                    Algo::Hopalong { a, b, c } => {
+                        hopalong_field(sx, sy, t, a, b, c, bass, mid, treb, ctx.quality)
+                    }
+                    Algo::Ikeda { u } => ikeda_field(sx, sy, t, u, bass, mid, treb, ctx.quality),
+                    Algo::HexTunnel { freq } => hex_tunnel(sx, sy, t, freq, bass, mid, treb, beat_pulse),
+                    Algo::Gyroid { freq } => gyroid_slice(sx, sy, t, freq, bass, mid, treb, beat_pulse),
+                    Algo::Phyllotaxis { petals } => {
+                        phyllotaxis(sx, sy, t, petals, bass, mid, treb, beat_pulse, ctx.quality)
+                    }
+                    Algo::Nova { c } => nova_fractal(sx, sy, t, c, bass, mid, treb, beat_pulse, ctx.quality),
                 };
 
                 // Extra "psychedelic pop": beat injects energy into the field.
@@ -719,6 +789,74 @@ impl Preset for FieldPreset {
                     }
                 }
             }
+        }
+
+        apply_post_fx(out, w, h, t, route, ctx.quality);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RouteMap {
+    bass: f32,
+    mid: f32,
+    treb: f32,
+    onset: f32,
+    energy: f32,
+    beat: f32,
+    transient: f32,
+    drive: f32,
+    zoom: f32,
+    orbit: f32,
+    detail: f32,
+    fx_mix: f32,
+    chroma: f32,
+    scanline: f32,
+    vignette: f32,
+    bloom: f32,
+}
+
+impl RouteMap {
+    fn from_ctx(ctx: &RenderCtx) -> Self {
+        let bands = &ctx.audio.bands;
+        let bass = (0.56 * bands[0] + 0.44 * bands[1]).clamp(0.0, 1.0);
+        let mid = (0.22 * bands[2] + 0.46 * bands[3] + 0.32 * bands[4]).clamp(0.0, 1.0);
+        let treb = (0.34 * bands[5] + 0.66 * bands[6]).clamp(0.0, 1.0);
+        let onset = ctx.audio.onset.clamp(0.0, 1.0);
+        let energy = ctx.audio.rms.clamp(0.0, 1.0);
+
+        let mut beat = ctx.beat_pulse.clamp(0.0, 1.0);
+        if ctx.safe {
+            beat = (beat * 0.6).min(0.6);
+        }
+
+        let transient = smoothed_transient_drive(beat, onset);
+        let drive = smoothed_motion_drive(bass, mid, treb, beat, onset);
+        let zoom = (0.55 + 0.68 * drive + 0.33 * transient).clamp(0.35, 1.85);
+        let orbit = (0.28 + 0.54 * mid + 0.34 * treb + 0.22 * transient).clamp(0.12, 1.45);
+        let detail = (0.26 + 0.50 * treb + 0.28 * transient + 0.10 * mid).clamp(0.0, 1.0);
+        let fx_mix = (0.10 + 0.52 * energy + 0.38 * transient + 0.12 * drive).clamp(0.0, 1.0);
+        let chroma = (0.35 + 1.95 * transient + 1.15 * treb).clamp(0.0, 3.8);
+        let scanline = (0.08 + 0.24 * energy + 0.24 * mid + 0.10 * drive).clamp(0.0, 0.8);
+        let vignette = (0.18 + 0.42 * bass + 0.16 * transient).clamp(0.0, 0.95);
+        let bloom = (0.06 + 0.40 * energy + 0.26 * treb + 0.12 * transient).clamp(0.0, 0.95);
+
+        Self {
+            bass,
+            mid,
+            treb,
+            onset,
+            energy,
+            beat,
+            transient,
+            drive,
+            zoom,
+            orbit,
+            detail,
+            fx_mix,
+            chroma,
+            scanline,
+            vignette,
+            bloom,
         }
     }
 }
@@ -759,14 +897,41 @@ fn fractal_mandelbrot(
     (i as f32 / max_iter as f32).sqrt()
 }
 
-fn fractal_zoom_motion(t: f32, zoom_mul: f32, bass: f32, beat: f32) -> f32 {
+#[inline]
+fn smoothed_transient_drive(beat: f32, onset: f32) -> f32 {
+    let x = (0.62 * beat.clamp(0.0, 1.0) + 0.38 * onset.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+#[inline]
+fn smoothed_motion_drive(bass: f32, mid: f32, treb: f32, beat: f32, onset: f32) -> f32 {
+    let groove = (0.58 * bass + 0.27 * mid + 0.15 * treb).clamp(0.0, 1.0);
+    let pulse = beat.clamp(0.0, 1.0);
+    let trans = onset.clamp(0.0, 1.0);
+    let accent = pulse.max(trans);
+    let x = (0.76 * groove + 0.16 * accent + 0.08 * pulse).clamp(0.0, 1.0);
+    let eased = x * x * (3.0 - 2.0 * x);
+    (eased * (0.90 + 0.20 * accent)).clamp(0.0, 1.0)
+}
+
+fn fractal_zoom_motion(
+    t: f32,
+    zoom_mul: f32,
+    bass: f32,
+    mid: f32,
+    treb: f32,
+    beat: f32,
+    onset: f32,
+) -> f32 {
     if zoom_mul <= 0.0 {
         return 1.0;
     }
     let zm = zoom_mul.clamp(0.35, 2.5);
-    let phase = (t * (0.11 + 0.09 * bass) * zm + beat * 0.05).fract();
-    let e = phase * phase * (3.0 - 2.0 * phase); // smoothstep
-    0.95 + (1.0 + 2.2 * zm) * e
+    let drive = smoothed_motion_drive(bass, mid, treb, beat, onset);
+    let transient = smoothed_transient_drive(beat, onset);
+    let rate = (0.085 + 0.075 * drive).max(0.01) * zm * (1.0 + 0.40 * transient);
+    let lz = (1.0 + t.max(0.0) * rate).log2();
+    1.0 + (0.72 + 1.70 * zm) * lz * (1.0 + 0.16 * drive)
 }
 
 fn fractal_motion_xy(
@@ -778,17 +943,124 @@ fn fractal_motion_xy(
     mid: f32,
     treb: f32,
     beat: f32,
+    onset: f32,
 ) -> (f32, f32) {
     if zoom_mul <= 0.0 {
         return (x, y);
     }
     let zm = zoom_mul.clamp(0.35, 8.0);
-    let phase = (t * (0.13 + 0.10 * bass) * zm + beat * 0.05).fract();
-    let e = phase * phase * (3.0 - 2.0 * phase);
-    let zcam = 2.0f32.powf(e * (1.0 + 1.2 * zm));
-    let dx = 0.08 * (t * 0.43 + 0.7 * mid).sin();
-    let dy = 0.08 * (t * 0.37 + 0.6 * treb).cos();
+    let drive = smoothed_motion_drive(bass, mid, treb, beat, onset);
+    let transient = smoothed_transient_drive(beat, onset);
+    let rate = (0.095 + 0.10 * drive).max(0.01) * zm * (1.0 + 0.32 * transient);
+    let lz = (1.0 + t.max(0.0) * rate).log2();
+    let zcam = 1.0 + (1.06 + 1.42 * zm) * lz * (1.0 + 0.12 * drive);
+    let drift_gain = (1.0 + (0.40 + 0.26 * drive) * lz).clamp(1.0, 6.0);
+    let phase = 0.55 * mid + 0.45 * treb;
+    let dx = 0.072 * drift_gain * (t * (0.40 + 0.07 * drive) + 0.75 * phase + 0.85 * transient).sin();
+    let dy = 0.072 * drift_gain * (t * (0.35 + 0.08 * drive) + 0.70 * phase - 0.62 * transient).cos();
     ((x + dx) / zcam, (y + dy) / zcam)
+}
+
+fn deep_zoom_power(
+    t: f32,
+    speed: f32,
+    zoom_mul: f32,
+    beat: f32,
+    drive: f32,
+    base: f32,
+    span: f32,
+) -> f32 {
+    if zoom_mul <= 0.0 {
+        return base;
+    }
+    let zm = zoom_mul.clamp(0.35, 2.5);
+    let beat = beat.clamp(0.0, 1.0);
+    let drive = drive.clamp(0.0, 1.0);
+    let rate = (0.085 + 0.18 * speed.max(0.0) + 0.08 * drive) * zm;
+    let sweep = t.max(0.0) * rate;
+    let growth = (sweep * (0.82 + 0.44 * drive)).ln_1p();
+    base + span * 0.105 * growth * (1.0 + 0.18 * beat)
+}
+
+#[derive(Clone, Copy)]
+struct DeepCamera {
+    zoom: f32,
+    scale: f32,
+    cx: f32,
+    cy: f32,
+    perturb: (f32, f32),
+    detail: f32,
+}
+
+#[inline]
+fn rebased_coord(anchor: f32, drift: f32, scale: f32) -> f32 {
+    let step = (scale.abs() * 18.0).max(1e-8);
+    let world = anchor + drift;
+    let rebased = (world / step).round() * step;
+    let local = (world - rebased).clamp(-step * 0.45, step * 0.45);
+    rebased + local
+}
+
+fn deep_camera_rebased(
+    t: f32,
+    center: (f32, f32),
+    orbit: (f32, f32),
+    speed: f32,
+    zoom_mul: f32,
+    bass: f32,
+    mid: f32,
+    treb: f32,
+    beat: f32,
+    onset: f32,
+    base: f32,
+    span: f32,
+    base_scale: f32,
+    orbit_drive: f32,
+    detail_hint: f32,
+) -> DeepCamera {
+    let drive = smoothed_motion_drive(bass, mid, treb, beat, onset);
+    let transient = smoothed_transient_drive(beat, onset);
+    let detail = (detail_hint + 0.18 * drive + 0.22 * treb).clamp(0.0, 1.0);
+    let power = deep_zoom_power(t, speed, zoom_mul, beat, drive, base, span);
+    let zoom = 2.0f32.powf(power);
+    let scale = base_scale / zoom.max(1.0);
+
+    let orbit_gain = orbit_drive.clamp(0.1, 1.8);
+    let orbit_scale = scale * (24.0 + 56.0 * (0.25 + detail)) * orbit_gain;
+    let ox = orbit.0 * (t * (0.11 + 0.08 * mid + 0.05 * speed.max(0.0)) + 1.5 * transient).sin() * orbit_scale;
+    let oy = orbit.1 * (t * (0.09 + 0.07 * treb + 0.04 * speed.max(0.0)) - 1.2 * transient).cos() * orbit_scale;
+
+    let cx = rebased_coord(center.0, ox, scale);
+    let cy = rebased_coord(center.1, oy, scale);
+
+    let p_amp = scale * (0.08 + 0.34 * detail);
+    let p_phase = t * (0.92 + 0.45 * drive + 0.35 * speed.max(0.0));
+    let perturb = (
+        p_amp * (p_phase + center.0 * 19.0 + beat * 2.3).sin(),
+        p_amp * (p_phase * 0.83 + center.1 * 17.0 - onset * 1.9).cos(),
+    );
+
+    DeepCamera {
+        zoom,
+        scale,
+        cx,
+        cy,
+        perturb,
+        detail,
+    }
+}
+
+#[inline]
+fn deep_detail_mod(nu: f32, x: f32, y: f32, t: f32, zoom: f32, detail: f32, beat: f32, seed: u32) -> f32 {
+    let noise = hash_noise(
+        x * (44.0 + 72.0 * detail) + t * 0.31,
+        y * (48.0 + 66.0 * detail) - t * 0.27,
+        seed,
+    );
+    let filigree = ((nu * (0.11 + 0.16 * detail)) + (x * 2.7 - y * 2.1) + t * (0.9 + 1.5 * beat)).sin() * 0.5
+        + 0.5;
+    let depth_boost = (zoom.log2().max(1.0) * 0.015 * (0.4 + detail)).clamp(0.0, 0.24);
+    ((0.74 + 0.26 * filigree) * (0.86 + 0.22 * noise) + depth_boost).clamp(0.62, 1.35)
 }
 
 fn fractal_julia(
@@ -835,31 +1107,38 @@ fn fractal_mandelbrot_deep(
     mid: f32,
     treb: f32,
     beat: f32,
+    onset: f32,
+    orbit_drive: f32,
+    detail: f32,
     quality: Quality,
 ) -> f32 {
-    let max_iter = match quality {
+    let max_iter_base = match quality {
         Quality::Ultra => 240u32,
         Quality::High => 192u32,
         Quality::Balanced => 144u32,
         Quality::Fast => 96u32,
     };
+    let max_iter = ((max_iter_base as f32) * (1.0 + 0.25 * detail.clamp(0.0, 1.0))) as u32;
 
-    let speed = if zoom_mul <= 0.0 {
-        0.0
-    } else {
-        speed * zoom_mul.clamp(0.35, 2.5)
-    };
-    let phase = (t * speed * (0.22 + 0.20 * bass) + beat * 0.04).fract();
-    let ease = phase * phase * (3.0 - 2.0 * phase);
-    let power = 1.6 + 16.4 * ease;
-    let zoom = 2.0f32.powf(power);
-    let scale = 1.9 / zoom.max(1.0);
-
-    let orbit_scale = scale * (40.0 + 40.0 * treb);
-    let cx = center.0 + orbit.0 * (t * (0.17 + 0.12 * mid)).sin() * orbit_scale;
-    let cy = center.1 + orbit.1 * (t * (0.13 + 0.10 * treb)).cos() * orbit_scale;
-    let cr = cx + x * scale;
-    let ci = cy + y * scale;
+    let cam = deep_camera_rebased(
+        t,
+        center,
+        orbit,
+        speed,
+        zoom_mul,
+        bass,
+        mid,
+        treb,
+        beat,
+        onset,
+        1.6,
+        16.4,
+        1.9,
+        orbit_drive,
+        detail,
+    );
+    let cr = cam.cx + (x + cam.perturb.0) * cam.scale;
+    let ci = cam.cy + (y + cam.perturb.1) * cam.scale;
 
     let mut zr = 0.0f32;
     let mut zi = 0.0f32;
@@ -882,7 +1161,8 @@ fn fractal_mandelbrot_deep(
     let nu = i as f32 + 1.0 - (m2.max(1.0001).ln().ln() / std::f32::consts::LN_2);
     let n = (nu / max_iter as f32).clamp(0.0, 1.0);
     let stripe = ((nu * (0.10 + 0.06 * treb)) + t * (0.8 + 1.4 * beat)).sin() * 0.5 + 0.5;
-    ((1.0 - n).powf(0.33) * 0.72 + stripe * 0.28).clamp(0.0, 1.0)
+    let detail_mod = deep_detail_mod(nu, x, y, t, cam.zoom, cam.detail, beat, 0xA9E3_1F52);
+    (((1.0 - n).powf(0.33) * 0.68 + stripe * 0.32) * detail_mod).clamp(0.0, 1.0)
 }
 
 fn fractal_julia_deep(
@@ -896,31 +1176,51 @@ fn fractal_julia_deep(
     mid: f32,
     treb: f32,
     beat: f32,
+    onset: f32,
+    orbit_drive: f32,
+    detail: f32,
     quality: Quality,
 ) -> f32 {
-    let max_iter = match quality {
+    let max_iter_base = match quality {
         Quality::Ultra => 220u32,
         Quality::High => 176u32,
         Quality::Balanced => 132u32,
         Quality::Fast => 88u32,
     };
+    let max_iter = ((max_iter_base as f32) * (1.0 + 0.22 * detail.clamp(0.0, 1.0))) as u32;
 
-    let speed = if zoom_mul <= 0.0 {
-        0.0
-    } else {
-        speed * zoom_mul.clamp(0.35, 2.5)
-    };
-    let phase = (t * speed * (0.22 + 0.20 * mid) + beat * 0.04).fract();
-    let ease = phase * phase * (3.0 - 2.0 * phase);
-    let power = 1.2 + 15.8 * ease;
-    let zoom = 2.0f32.powf(power);
-    let scale = 1.8 / zoom.max(1.0);
+    let cam = deep_camera_rebased(
+        t,
+        (0.0, 0.0),
+        (0.58, 0.44),
+        speed,
+        zoom_mul,
+        bass,
+        mid,
+        treb,
+        beat,
+        onset,
+        1.2,
+        15.8,
+        1.8,
+        orbit_drive,
+        detail,
+    );
 
-    let cx = c_base.0 + 0.16 * (t * (0.21 + treb * 0.25)).cos() + bass * 0.05;
-    let cy = c_base.1 + 0.15 * (t * (0.19 + bass * 0.22)).sin() - treb * 0.04;
+    let c_scale = cam.scale * (24.0 + 36.0 * cam.detail) * orbit_drive.clamp(0.2, 1.8);
+    let cx = rebased_coord(
+        c_base.0,
+        0.16 * (t * (0.21 + treb * 0.25)).cos() + bass * 0.05 + c_scale * (t * (0.17 + 0.08 * mid)).sin(),
+        cam.scale,
+    );
+    let cy = rebased_coord(
+        c_base.1,
+        0.15 * (t * (0.19 + bass * 0.22)).sin() - treb * 0.04 + c_scale * (t * (0.13 + 0.09 * treb)).cos(),
+        cam.scale,
+    );
 
-    let mut zr = x * scale;
-    let mut zi = y * scale;
+    let mut zr = cam.cx + (x + cam.perturb.0) * cam.scale;
+    let mut zi = cam.cy + (y + cam.perturb.1) * cam.scale;
     let mut i = 0u32;
     let mut m2 = 0.0f32;
     while i < max_iter {
@@ -940,7 +1240,8 @@ fn fractal_julia_deep(
     let nu = i as f32 + 1.0 - (m2.max(1.0001).ln().ln() / std::f32::consts::LN_2);
     let n = (nu / max_iter as f32).clamp(0.0, 1.0);
     let stripe = ((nu * (0.12 + 0.05 * treb)) - t * (0.9 + 1.2 * beat)).sin() * 0.5 + 0.5;
-    ((1.0 - n).powf(0.30) * 0.68 + stripe * 0.32).clamp(0.0, 1.0)
+    let detail_mod = deep_detail_mod(nu, x, y, t, cam.zoom, cam.detail, beat, 0xC31D_2A91);
+    (((1.0 - n).powf(0.30) * 0.66 + stripe * 0.34) * detail_mod).clamp(0.0, 1.0)
 }
 
 fn fractal_burning_ship(
@@ -992,30 +1293,39 @@ fn fractal_burning_ship_deep(
     mid: f32,
     treb: f32,
     beat: f32,
+    onset: f32,
+    orbit_drive: f32,
+    detail: f32,
     quality: Quality,
 ) -> f32 {
-    let max_iter = match quality {
+    let max_iter_base = match quality {
         Quality::Ultra => 240u32,
         Quality::High => 192u32,
         Quality::Balanced => 144u32,
         Quality::Fast => 96u32,
     };
+    let max_iter = ((max_iter_base as f32) * (1.0 + 0.20 * detail.clamp(0.0, 1.0))) as u32;
 
-    let speed = if zoom_mul <= 0.0 {
-        0.0
-    } else {
-        speed * zoom_mul.clamp(0.35, 2.5)
-    };
-    let phase = (t * speed * (0.22 + 0.20 * bass) + beat * 0.04).fract();
-    let ease = phase * phase * (3.0 - 2.0 * phase);
-    let power = 1.1 + 15.4 * ease;
-    let zoom = 2.0f32.powf(power);
-    let scale = 2.0 / zoom.max(1.0);
-
-    let cx = center.0 + (scale * 46.0) * (t * (0.11 + 0.08 * mid)).sin();
-    let cy = center.1 + (scale * 36.0) * (t * (0.09 + 0.07 * treb)).cos();
-    let cr = cx + x * scale;
-    let ci = cy + y * scale;
+    let orbit = (0.52 + 0.24 * bass, 0.44 + 0.20 * treb);
+    let cam = deep_camera_rebased(
+        t,
+        center,
+        orbit,
+        speed,
+        zoom_mul,
+        bass,
+        mid,
+        treb,
+        beat,
+        onset,
+        1.1,
+        15.4,
+        2.0,
+        orbit_drive,
+        detail,
+    );
+    let cr = cam.cx + (x + cam.perturb.0) * cam.scale;
+    let ci = cam.cy + (y + cam.perturb.1) * cam.scale;
 
     let mut zr = 0.0f32;
     let mut zi = 0.0f32;
@@ -1039,8 +1349,9 @@ fn fractal_burning_ship_deep(
 
     let nu = i as f32 + 1.0 - (m2.max(1.0001).ln().ln() / std::f32::consts::LN_2);
     let n = (nu / max_iter as f32).clamp(0.0, 1.0);
-    let grain = ((x * 120.0 + y * 90.0 + t * (1.2 + 1.8 * beat)).sin() * 0.5 + 0.5) * 0.18;
-    ((1.0 - n).powf(0.36) * 0.82 + grain).clamp(0.0, 1.0)
+    let grain = ((x * 120.0 + y * 90.0 + t * (1.2 + 1.8 * beat)).sin() * 0.5 + 0.5) * 0.14;
+    let detail_mod = deep_detail_mod(nu, x, y, t, cam.zoom, cam.detail, beat, 0x6F4A_73D2);
+    (((1.0 - n).powf(0.36) * 0.78 + grain) * detail_mod).clamp(0.0, 1.0)
 }
 
 fn fractal_orbit_trap(
@@ -1371,6 +1682,315 @@ fn moire(x: f32, y: f32, t: f32, freq: f32, bass: f32, treb: f32, beat: f32) -> 
     (v * (1.0 / 3.0) * 0.5 + 0.5).clamp(0.0, 1.0)
 }
 
+fn hopalong_field(
+    x: f32,
+    y: f32,
+    t: f32,
+    a0: f32,
+    b0: f32,
+    c0: f32,
+    bass: f32,
+    mid: f32,
+    treb: f32,
+    quality: Quality,
+) -> f32 {
+    let iters = match quality {
+        Quality::Ultra => 30u32,
+        Quality::High => 24u32,
+        Quality::Balanced => 18u32,
+        Quality::Fast => 12u32,
+    };
+
+    let a = a0 + 0.55 * bass + 0.10 * (t * 0.19).sin();
+    let b = b0 + 0.45 * mid + 0.08 * (t * 0.15).cos();
+    let c = c0 + 0.35 * treb;
+
+    let mut zx = x * (1.15 + 0.55 * mid);
+    let mut zy = y * (1.15 + 0.55 * mid);
+    let mut acc = 0.0f32;
+
+    for _ in 0..iters {
+        let k = (b * zx - c).abs().sqrt();
+        let nx = zy - zx.signum() * k;
+        let ny = a - zx;
+        zx = nx * 0.78 + 0.22 * x;
+        zy = ny * 0.78 + 0.22 * y;
+
+        let r2 = zx * zx + zy * zy;
+        acc += (-1.1 * r2).exp();
+    }
+
+    (acc / iters as f32 * (1.0 + 0.52 * treb)).clamp(0.0, 1.0)
+}
+
+fn ikeda_field(x: f32, y: f32, t: f32, u0: f32, bass: f32, mid: f32, treb: f32, quality: Quality) -> f32 {
+    let iters = match quality {
+        Quality::Ultra => 28u32,
+        Quality::High => 22u32,
+        Quality::Balanced => 16u32,
+        Quality::Fast => 12u32,
+    };
+    let u = (u0 + 0.06 * bass - 0.04 * treb).clamp(0.72, 0.96);
+
+    let mut zx = x * 0.75;
+    let mut zy = y * 0.75;
+    let mut acc = 0.0f32;
+    for i in 0..iters {
+        let rr = 1.0 + zx * zx + zy * zy;
+        let tau = 0.4 - 6.0 / rr;
+        let ct = tau.cos();
+        let st = tau.sin();
+        let nx = 1.0 + u * (zx * ct - zy * st);
+        let ny = u * (zx * st + zy * ct);
+        let fi = i as f32;
+        zx = nx + 0.014 * (t * (0.31 + 0.06 * mid) + fi * 0.017).sin();
+        zy = ny + 0.014 * (t * (0.29 + 0.05 * treb) + fi * 0.013).cos();
+
+        let dx = zx - x * 0.45;
+        let dy = zy - y * 0.45;
+        acc += (-0.88 * (dx * dx + dy * dy)).exp();
+    }
+
+    (acc / iters as f32 * (0.95 + 0.5 * bass + 0.25 * mid)).clamp(0.0, 1.0)
+}
+
+fn hex_tunnel(x: f32, y: f32, t: f32, freq: f32, bass: f32, mid: f32, treb: f32, beat: f32) -> f32 {
+    let r = (x * x + y * y).sqrt().max(1e-4);
+    let inv_r = 1.0 / r;
+
+    let ux = x * freq * (1.08 + 0.72 * bass) + t * (0.35 + 0.15 * mid);
+    let uy = y * freq * (1.08 + 0.62 * treb) - t * (0.27 + 0.13 * treb);
+    let l1 = ux.sin().abs();
+    let l2 = (0.5 * ux + 0.866_025_4 * uy).sin().abs();
+    let l3 = (0.5 * ux - 0.866_025_4 * uy).sin().abs();
+    let lattice = 1.0 - ((l1 + l2 + l3) / 3.0).clamp(0.0, 1.0);
+
+    let tunnel = (inv_r * (0.9 + 0.75 * bass) - t * (1.0 + beat * 1.8) + mid * 2.3).sin() * 0.5 + 0.5;
+    (lattice.powf(1.6) * 0.58 + tunnel * 0.42).clamp(0.0, 1.0)
+}
+
+fn gyroid_slice(x: f32, y: f32, t: f32, freq: f32, bass: f32, mid: f32, treb: f32, beat: f32) -> f32 {
+    let f = freq * (1.0 + 0.85 * mid);
+    let gx = x * f + 0.40 * (t * 0.29).sin();
+    let gy = y * f + 0.36 * (t * 0.25).cos();
+    let gz = t * (0.72 + 1.35 * bass) + (x - y) * (0.8 + 1.2 * treb);
+
+    let g = (gx.sin() * gy.cos() + gy.sin() * gz.cos() + gz.sin() * gx.cos()) * (1.0 / 1.5);
+    let shell = (1.0 - g.abs()).clamp(0.0, 1.0).powf(0.75 + 0.22 * (1.0 - treb));
+    let shimmer = ((g * (6.0 + 10.0 * treb) + t * (1.1 + beat * 1.9)).sin() * 0.5 + 0.5) * 0.32;
+    (shell * 0.82 + shimmer).clamp(0.0, 1.0)
+}
+
+fn phyllotaxis(
+    x: f32,
+    y: f32,
+    t: f32,
+    petals: u32,
+    bass: f32,
+    mid: f32,
+    treb: f32,
+    beat: f32,
+    quality: Quality,
+) -> f32 {
+    let base = petals.clamp(24, 180);
+    let count = match quality {
+        Quality::Ultra => base.min(144),
+        Quality::High => base.min(110),
+        Quality::Balanced => base.min(78),
+        Quality::Fast => base.min(52),
+    };
+    let golden = 2.399_963_1f32;
+
+    let scale = 1.25 + 0.32 * bass;
+    let xx = x * scale;
+    let yy = y * scale;
+    let mut best = 1e9f32;
+    for i in 0..count {
+        let fi = i as f32 + 1.0;
+        let rr = (fi / count as f32).sqrt() * (0.24 + 0.78 * (0.55 + 0.45 * bass));
+        let ang = fi * golden + t * (0.17 + 0.32 * mid) + rr * (3.5 + 1.2 * treb);
+        let px = rr * ang.cos();
+        let py = rr * ang.sin();
+        let dx = xx - px;
+        let dy = yy - py;
+        let d2 = dx * dx + dy * dy;
+        if d2 < best {
+            best = d2;
+        }
+    }
+
+    let bloom = (-42.0 * best).exp().clamp(0.0, 1.0);
+    let halo = (((xx * xx + yy * yy).sqrt()) * (15.0 + 10.0 * treb) - t * (0.9 + beat * 2.3)).sin() * 0.5 + 0.5;
+    (bloom * 0.72 + halo * 0.28).clamp(0.0, 1.0)
+}
+
+fn nova_fractal(
+    x: f32,
+    y: f32,
+    t: f32,
+    c: (f32, f32),
+    bass: f32,
+    mid: f32,
+    treb: f32,
+    beat: f32,
+    quality: Quality,
+) -> f32 {
+    let max_iter = match quality {
+        Quality::Ultra => 96u32,
+        Quality::High => 76u32,
+        Quality::Balanced => 56u32,
+        Quality::Fast => 40u32,
+    };
+
+    let scale = 1.25 / (1.0 + 0.24 * bass + 0.16 * beat);
+    let mut zr = x * scale;
+    let mut zi = y * scale;
+    let cr = c.0 + 0.08 * (t * (0.23 + mid * 0.21)).sin();
+    let ci = c.1 + 0.08 * (t * (0.19 + treb * 0.24)).cos();
+
+    let mut i = 0u32;
+    let mut trap = 1e9f32;
+    while i < max_iter {
+        let zr2 = zr * zr - zi * zi;
+        let zi2 = 2.0 * zr * zi;
+        let zr3 = zr2 * zr - zi2 * zi;
+        let zi3 = zr2 * zi + zi2 * zr;
+
+        let fr = zr3 - 1.0;
+        let fi = zi3;
+        let dr = 3.0 * zr2;
+        let di = 3.0 * zi2;
+        let denom = (dr * dr + di * di).max(1e-6);
+        let qr = (fr * dr + fi * di) / denom;
+        let qi = (fi * dr - fr * di) / denom;
+
+        zr = zr - qr + cr * 0.028;
+        zi = zi - qi + ci * 0.028;
+
+        let d1 = (zr - 1.0) * (zr - 1.0) + zi * zi;
+        let d2 = (zr + 0.5) * (zr + 0.5) + (zi - 0.866_025_4) * (zi - 0.866_025_4);
+        let d3 = (zr + 0.5) * (zr + 0.5) + (zi + 0.866_025_4) * (zi + 0.866_025_4);
+        trap = trap.min(d1.min(d2.min(d3)));
+
+        if zr * zr + zi * zi > 48.0 {
+            break;
+        }
+        i += 1;
+    }
+    if i >= max_iter {
+        return 0.0;
+    }
+
+    let n = (i as f32 / max_iter as f32).clamp(0.0, 1.0);
+    let root_glow = (-12.0 * trap.sqrt()).exp().clamp(0.0, 1.0);
+    let stripe = ((zr * 3.8 + zi * 2.9 + t * (1.1 + 1.6 * beat)).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+    ((1.0 - n).powf(0.42) * 0.56 + root_glow * 0.30 + stripe * 0.14).clamp(0.0, 1.0)
+}
+
+fn apply_post_fx(out: &mut [u8], w: usize, h: usize, t: f32, route: RouteMap, quality: Quality) {
+    let frame_len = w.saturating_mul(h).saturating_mul(4);
+    if out.len() < frame_len || w == 0 || h == 0 {
+        return;
+    }
+
+    let fx_mix = route.fx_mix.clamp(0.0, 1.0);
+    if fx_mix <= 0.02 {
+        return;
+    }
+
+    const BLOOM_FAST: &[(isize, isize, f32)] = &[(0, 0, 0.50), (1, 0, 0.25), (-1, 0, 0.25)];
+    const BLOOM_BALANCED: &[(isize, isize, f32)] = &[
+        (0, 0, 0.36),
+        (1, 0, 0.16),
+        (-1, 0, 0.16),
+        (0, 1, 0.16),
+        (0, -1, 0.16),
+    ];
+    const BLOOM_HIGH: &[(isize, isize, f32)] = &[
+        (0, 0, 0.26),
+        (1, 0, 0.12),
+        (-1, 0, 0.12),
+        (0, 1, 0.12),
+        (0, -1, 0.12),
+        (1, 1, 0.065),
+        (-1, 1, 0.065),
+        (1, -1, 0.065),
+        (-1, -1, 0.065),
+    ];
+
+    let taps = match quality {
+        Quality::Fast => BLOOM_FAST,
+        Quality::Balanced => BLOOM_BALANCED,
+        Quality::High | Quality::Ultra => BLOOM_HIGH,
+    };
+
+    let src = out[..frame_len].to_vec();
+    let chroma = (route.chroma * fx_mix).clamp(0.0, 4.0);
+    let scan_amt = (route.scanline * fx_mix).clamp(0.0, 0.85);
+    let vig_amt = (route.vignette * fx_mix).clamp(0.0, 0.92);
+    let bloom_amt = (route.bloom * fx_mix).clamp(0.0, 0.95);
+
+    let cx = (w as f32 - 1.0) * 0.5;
+    let cy = (h as f32 - 1.0) * 0.5;
+    let inv_rx = 1.0 / cx.max(1.0);
+    let inv_ry = 1.0 / cy.max(1.0);
+
+    for y in 0..h {
+        let yf = y as f32;
+        let scan_phase = yf * (0.28 + route.treb * 0.08) + t * (24.0 + 34.0 * route.transient);
+        let scanline = 1.0 - scan_amt * (0.45 + 0.55 * scan_phase.sin().abs());
+
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let mut r = src[i] as f32 / 255.0;
+            let mut g = src[i + 1] as f32 / 255.0;
+            let mut b = src[i + 2] as f32 / 255.0;
+
+            if chroma > 0.01 {
+                let wobble = 1.0 + 0.35 * (yf * 0.11 + t * (2.4 + route.drive)).sin();
+                let shift = (chroma * wobble).round() as isize;
+                let rr = sample_chan(&src, w, h, x as isize + shift, y as isize, 0) as f32 / 255.0;
+                let bb = sample_chan(&src, w, h, x as isize - shift, y as isize, 2) as f32 / 255.0;
+                r = rr * 0.86 + r * 0.14;
+                b = bb * 0.86 + b * 0.14;
+            }
+
+            if bloom_amt > 0.01 {
+                let mut lum_sum = 0.0f32;
+                let mut wsum = 0.0001f32;
+                for &(dx, dy, ww) in taps {
+                    let tr = sample_chan(&src, w, h, x as isize + dx, y as isize + dy, 0) as f32 / 255.0;
+                    let tg = sample_chan(&src, w, h, x as isize + dx, y as isize + dy, 1) as f32 / 255.0;
+                    let tb = sample_chan(&src, w, h, x as isize + dx, y as isize + dy, 2) as f32 / 255.0;
+                    let lum = tr * 0.2126 + tg * 0.7152 + tb * 0.0722;
+                    lum_sum += lum * ww;
+                    wsum += ww;
+                }
+                let neighborhood = lum_sum / wsum;
+                let glow = (neighborhood - (0.52 - 0.18 * route.energy)).max(0.0) * bloom_amt;
+                r = (r + glow * (0.82 + 0.28 * route.treb)).clamp(0.0, 1.0);
+                g = (g + glow * (0.76 + 0.26 * route.mid)).clamp(0.0, 1.0);
+                b = (b + glow * (0.84 + 0.30 * route.bass)).clamp(0.0, 1.0);
+            }
+
+            let nx = (x as f32 - cx) * inv_rx;
+            let ny = (y as f32 - cy) * inv_ry;
+            let rad = (nx * nx + ny * ny).clamp(0.0, 1.0);
+            let vignette = (1.0 - rad.powf(1.18 + 1.4 * vig_amt)).clamp(0.0, 1.0);
+            let gain = (0.74 + 0.26 * vignette) * scanline;
+
+            r = (r * gain).clamp(0.0, 1.0);
+            g = (g * gain).clamp(0.0, 1.0);
+            b = (b * gain).clamp(0.0, 1.0);
+
+            out[i] = (r * 255.0) as u8;
+            out[i + 1] = (g * 255.0) as u8;
+            out[i + 2] = (b * 255.0) as u8;
+            out[i + 3] = 255;
+        }
+    }
+}
+
 fn palette(p: Palette, v: f32, t: f32, bass: f32, mid: f32, treb: f32, beat: f32) -> [u8; 3] {
     let v = v.clamp(0.0, 1.0);
     let pop = (0.4 * bass + 0.3 * mid + 0.6 * treb + 0.8 * beat).clamp(0.0, 1.0);
@@ -1471,6 +2091,14 @@ fn hash_noise(x: f32, y: f32, seed: u32) -> f32 {
     n = (n ^ (n >> 13)).wrapping_mul(1_274_126_177);
     n = n ^ (n >> 16);
     ((n & 0x00FF_FFFF) as f32) / 16_777_215.0
+}
+
+#[inline]
+fn sample_chan(src: &[u8], w: usize, h: usize, x: isize, y: isize, ch: usize) -> u8 {
+    let xx = x.clamp(0, (w as isize) - 1) as usize;
+    let yy = y.clamp(0, (h as isize) - 1) as usize;
+    let i = (yy * w + xx) * 4 + ch.min(3);
+    src[i]
 }
 
 fn sample_rgb(prev: &[u8], w: usize, h: usize, nx: f32, ny: f32) -> [u8; 3] {

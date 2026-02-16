@@ -1,4 +1,4 @@
-use crate::render::{draw_overlay_popup, Frame, Renderer};
+use crate::render::{draw_overlay_popup, write_hud_line, Frame, Renderer};
 use std::io::Write;
 
 pub struct BrailleRenderer {
@@ -168,13 +168,14 @@ impl Renderer for BrailleRenderer {
         // HUD lines (bottom area)
         let mut hud_lines = frame.hud.lines();
         for i in 0..(frame.hud_rows as usize) {
-            write!(out, "\x1b[{};1H\x1b[0m\x1b[2K", visual_rows + i + 1)?;
-            if let Some(mut line) = hud_lines.next() {
-                if line.len() > cols {
-                    line = &line[..cols];
-                }
-                write!(out, "{line}")?;
-            }
+            write_hud_line(
+                out,
+                visual_rows + i + 1,
+                cols,
+                hud_lines.next(),
+                frame.hud_highlight,
+                frame.hud_highlight_phase,
+            )?;
         }
 
         if let Some(text) = frame.overlay {

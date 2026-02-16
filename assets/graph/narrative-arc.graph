@@ -1,0 +1,22 @@
+# Brotviz preset graph: evolving story arc from bloom -> drive -> finale.
+# Entry is the first node listed.
+
+node intro_bloom 46
+node flow_rise 47
+node vocal_sway 10
+node grid_charge 5
+node spiral_probe 42
+node wormhole 54
+node bass_cyclone 57
+node reactor_core 59
+node finale_nova 61
+
+edge intro_bloom flow_rise always
+edge flow_rise vocal_sway rms_ge 0.30
+edge vocal_sway grid_charge on_beat
+edge grid_charge spiral_probe beat_ge 0.55
+edge spiral_probe wormhole chance 0.65
+edge spiral_probe bass_cyclone chance 0.35
+edge wormhole reactor_core rms_ge 0.62
+edge bass_cyclone reactor_core beat_ge 0.58
+edge reactor_core finale_nova on_beat

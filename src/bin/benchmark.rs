@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tui_visualizer::audio::AudioFeatures;
 use tui_visualizer::config::{Quality, SwitchMode};
-use tui_visualizer::visual::{make_presets, RenderCtx, VisualEngine};
+use tui_visualizer::visual::{make_presets, CameraPathMode, PresetEngine, RenderCtx, VisualEngine};
 
 #[cfg(target_os = "macos")]
 use tui_visualizer::visual::MetalEngine;
@@ -18,12 +18,15 @@ enum Mode {
 struct Args {
     mode: Mode,
     frames: usize,
+    switch_frames: usize,
+    camera_frames: usize,
     w: usize,
     h: usize,
     quality: Quality,
     scale: usize,
     safe: bool,
     ci_smoke: bool,
+    quick: bool,
     max_ms: f64,
 }
 
@@ -31,12 +34,15 @@ fn parse_args() -> Args {
     let mut args = Args {
         mode: Mode::Cpu,
         frames: 180,
+        switch_frames: 72,
+        camera_frames: 60,
         w: 160,
         h: 88,
         quality: Quality::Balanced,
         scale: 1,
         safe: false,
         ci_smoke: false,
+        quick: false,
         max_ms: 20.0,
     };
 
@@ -61,6 +67,18 @@ fn parse_args() -> Args {
             ("--frames", Some(x)) => {
                 if let Ok(n) = x.parse::<usize>() {
                     args.frames = n.max(1);
+                }
+                i += 2;
+            }
+            ("--switch-frames", Some(x)) => {
+                if let Ok(n) = x.parse::<usize>() {
+                    args.switch_frames = n.max(1);
+                }
+                i += 2;
+            }
+            ("--camera-frames", Some(x)) => {
+                if let Ok(n) = x.parse::<usize>() {
+                    args.camera_frames = n.max(1);
                 }
                 i += 2;
             }
@@ -112,6 +130,14 @@ fn parse_args() -> Args {
                 args.ci_smoke = true;
                 i += 1;
             }
+            ("--quick", Some(x)) if !x.starts_with("--") => {
+                args.quick = parse_bool(x).unwrap_or(true);
+                i += 2;
+            }
+            ("--quick", _) => {
+                args.quick = true;
+                i += 1;
+            }
             ("--max-ms", Some(x)) => {
                 if let Ok(v) = x.parse::<f64>() {
                     args.max_ms = v.max(0.1);
@@ -122,6 +148,12 @@ fn parse_args() -> Args {
                 i += 1;
             }
         }
+    }
+
+    if args.quick {
+        args.frames = args.frames.min(60);
+        args.switch_frames = args.switch_frames.min(48);
+        args.camera_frames = args.camera_frames.min(36);
     }
 
     args
@@ -180,6 +212,163 @@ fn synth_audio(t: f32, step: usize) -> AudioFeatures {
     }
 }
 
+fn section_audio(step: usize, total_steps: usize) -> AudioFeatures {
+    let t = step as f32 / 60.0;
+    let mut audio = synth_audio(t, step);
+    let section = (step.saturating_mul(4)) / total_steps.max(1);
+    match section {
+        0 => {
+            audio.rms = (0.08 + audio.rms * 0.22).clamp(0.0, 1.0);
+            audio.onset = (audio.onset * 0.25).clamp(0.0, 1.0);
+            audio.beat = step % 48 == 0;
+            audio.beat_strength = if audio.beat { 0.35 } else { 0.0 };
+        }
+        1 => {
+            audio.rms = (0.18 + audio.rms * 0.40).clamp(0.0, 1.0);
+            audio.onset = (audio.onset * 0.55 + 0.1).clamp(0.0, 1.0);
+            audio.beat = step % 24 == 0;
+            if audio.beat {
+                audio.beat_strength = 0.58;
+            }
+        }
+        2 => {
+            audio.rms = (0.28 + audio.rms * 0.55).clamp(0.0, 1.0);
+            audio.onset = (audio.onset * 0.7 + 0.16).clamp(0.0, 1.0);
+            audio.beat = step % 16 == 0 || audio.beat;
+            if audio.beat {
+                audio.beat_strength = audio.beat_strength.max(0.72);
+            }
+        }
+        _ => {
+            audio.rms = (0.38 + audio.rms * 0.60).clamp(0.0, 1.0);
+            audio.onset = (audio.onset * 0.85 + 0.24).clamp(0.0, 1.0);
+            audio.beat = step % 12 == 0 || audio.beat;
+            if audio.beat {
+                audio.beat_strength = audio.beat_strength.max(0.88);
+            }
+        }
+    }
+    audio
+}
+
+fn set_camera_path_mode(engine: &mut PresetEngine, target: CameraPathMode) {
+    for _ in 0..6 {
+        if engine.camera_path_mode() == target {
+            return;
+        }
+        engine.step_camera_path_mode(true);
+    }
+}
+
+fn bench_section_aware_switching(args: &Args) {
+    let mut engine = PresetEngine::new(make_presets(), 0, false, SwitchMode::Adaptive, 4, 8.0);
+    engine.resize(args.w, args.h);
+
+    let frames = args.switch_frames.max(1);
+    let mut now = Instant::now();
+    let start = Instant::now();
+    let mut lit = 0usize;
+    let mut switches = 0usize;
+    let mut last_name = engine.preset_name().to_string();
+
+    for f in 0..frames {
+        now += Duration::from_millis(40);
+        let audio = section_audio(f, frames);
+        engine.update_auto_switch(now, &audio);
+        let ctx = RenderCtx {
+            now,
+            t: f as f32 / 60.0,
+            dt: 1.0 / 60.0,
+            w: args.w,
+            h: args.h,
+            audio,
+            beat_pulse: if audio.beat { (0.6 + audio.beat_strength * 0.4).min(1.0) } else { 0.0 },
+            fractal_zoom_mul: 1.0,
+            safe: args.safe,
+            quality: args.quality,
+            scale: args.scale,
+        };
+        let px = engine.render(ctx, args.quality, args.scale);
+        if px.chunks_exact(4).any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0) {
+            lit += 1;
+        }
+        let name = engine.preset_name();
+        if name != last_name {
+            switches = switches.saturating_add(1);
+            last_name = name.to_string();
+        }
+    }
+
+    let ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    println!(
+        "CPU section-aware switch: {:>8.3} ms/frame  switches={:>2}  section={}  final={}  lit={:>3}/{}",
+        ms,
+        switches,
+        engine.scene_section_name(),
+        engine.preset_name(),
+        lit,
+        frames
+    );
+}
+
+fn bench_camera_path_modes(args: &Args) {
+    let mut engine = PresetEngine::new(make_presets(), 0, false, SwitchMode::Manual, 16, 20.0);
+    engine.resize(args.w, args.h);
+
+    let frames = args.camera_frames.max(1);
+    let modes = [
+        CameraPathMode::Auto,
+        CameraPathMode::Orbit,
+        CameraPathMode::Dolly,
+        CameraPathMode::Helix,
+        CameraPathMode::Spiral,
+        CameraPathMode::Drift,
+    ];
+    println!(
+        "CPU camera-path benchmark: modes={} frames/mode={} size={}x{}",
+        modes.len(),
+        frames,
+        args.w,
+        args.h
+    );
+    for (mi, mode) in modes.iter().copied().enumerate() {
+        set_camera_path_mode(&mut engine, mode);
+
+        let start = Instant::now();
+        let mut lit = 0usize;
+        for f in 0..frames {
+            let t = f as f32 / 60.0;
+            let audio = synth_audio(t + mi as f32 * 0.031, f + mi * 17);
+            let ctx = RenderCtx {
+                now: Instant::now(),
+                t,
+                dt: 1.0 / 60.0,
+                w: args.w,
+                h: args.h,
+                audio,
+                beat_pulse: if audio.beat { (0.6 + audio.beat_strength * 0.4).min(1.0) } else { 0.0 },
+                fractal_zoom_mul: 1.0,
+                safe: args.safe,
+                quality: args.quality,
+                scale: args.scale,
+            };
+            let px = engine.render(ctx, args.quality, args.scale);
+            if px.chunks_exact(4).any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0) {
+                lit += 1;
+            }
+        }
+
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        println!(
+            "  {:<6} {:>8.3} ms/frame  lit={:>3}/{}",
+            mode.label(),
+            ms,
+            lit,
+            frames
+        );
+    }
+}
+
 fn bench_cpu(args: &Args) -> Result<()> {
     let mut presets = make_presets();
     let n = args.w.saturating_mul(args.h).saturating_mul(4);
@@ -189,8 +378,14 @@ fn bench_cpu(args: &Args) -> Result<()> {
     let mut slow_presets = Vec::<(String, f64)>::new();
 
     println!(
-        "CPU benchmark: presets={} frames/preset={} size={}x{} quality={:?} scale={}",
-        presets.len(), args.frames, args.w, args.h, args.quality, args.scale
+        "CPU benchmark: presets={} frames/preset={} size={}x{} quality={:?} scale={} quick={}",
+        presets.len(),
+        args.frames,
+        args.w,
+        args.h,
+        args.quality,
+        args.scale,
+        args.quick
     );
 
     for (idx, p) in presets.iter_mut().enumerate() {
@@ -240,6 +435,8 @@ fn bench_cpu(args: &Args) -> Result<()> {
     let avg_ms = total_time.as_secs_f64() * 1000.0 / total_frames.max(1) as f64;
     let fps = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
     println!("CPU summary: {:>8.3} ms/frame avg  {:>7.2} FPS", avg_ms, fps);
+    bench_section_aware_switching(args);
+    bench_camera_path_modes(args);
 
     if args.ci_smoke {
         if !black_presets.is_empty() || !slow_presets.is_empty() {

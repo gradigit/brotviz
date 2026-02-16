@@ -1,0 +1,9 @@
+# Brotviz theme pack: deep fractal travel with sustained zoom and high-detail structures.
+name=Fractal Infinite Dive
+tags=fractal,deep-zoom,hypnotic,cinematic
+presets=0,1,2,20,21,40,41,42,43,44,45,48,49,54,55,57,58,59,60,61
+transition.min_beats=10
+transition.max_beats=36
+transition.crossfade_ms=920
+defaults.intensity=1.08
+defaults.zoom=1.60

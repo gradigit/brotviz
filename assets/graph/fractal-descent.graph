@@ -1,0 +1,24 @@
+# Brotviz preset graph: progressive fractal descent with optional branch into heavier detail.
+# Entry is the first node listed.
+
+node start_mandel 0
+node seahorse 41
+node spiral 42
+node julia_bloom 43
+node cathedral 44
+node abyss_ship 45
+node neon_relic 49
+node gyroid_temple 50
+node hex_drive 58
+node nova_root 61
+
+edge start_mandel seahorse always
+edge seahorse spiral beat_ge 0.45
+edge spiral julia_bloom on_beat
+edge spiral abyss_ship chance 0.22
+edge julia_bloom cathedral rms_ge 0.40
+edge cathedral neon_relic beat_ge 0.55
+edge abyss_ship neon_relic rms_ge 0.48
+edge neon_relic gyroid_temple chance 0.50
+edge gyroid_temple hex_drive on_beat
+edge hex_drive nova_root rms_ge 0.60

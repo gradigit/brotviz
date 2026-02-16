@@ -1,0 +1,9 @@
+# Brotviz theme pack: broad psychedelic arc with rich fractals, fluid fields, and tunnels.
+name=Psychedelic Journey
+tags=psychedelic,balanced,fractal,journey
+presets=0,1,2,3,4,5,10,12,21,24,30,35,40,43,46,48,52,54,58,61
+transition.min_beats=8
+transition.max_beats=24
+transition.crossfade_ms=680
+defaults.intensity=0.95
+defaults.zoom=1.22

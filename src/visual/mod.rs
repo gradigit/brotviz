@@ -73,7 +73,7 @@ impl TransitionKind {
         Self::Fade
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) fn operator_label(self) -> &'static str {
         match self {
             Self::Fade => "Fade",
             Self::Zoom => "Zoom",
@@ -84,12 +84,16 @@ impl TransitionKind {
             Self::Cut => "Cut",
             Self::Morph => "Morph",
             Self::Wipe => "Wipe",
-            Self::Luma => "LumaKey",
-            Self::Flash => "FlashCut",
+            Self::Luma => "Luma Key",
+            Self::Flash => "Flash Cut",
             Self::Prism => "Prism",
             Self::Remix => "Remix",
             Self::Echo => "Echo",
         }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        self.operator_label()
     }
 }
 
@@ -127,12 +131,128 @@ impl TransitionMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneSection {
+    Calm,
+    Groove,
+    Drive,
+    Impact,
+}
+
+impl SceneSection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Calm => "Calm",
+            Self::Groove => "Groove",
+            Self::Drive => "Drive",
+            Self::Impact => "Impact",
+        }
+    }
+
+    const fn intensity_rank(self) -> i8 {
+        match self {
+            Self::Calm => 0,
+            Self::Groove => 1,
+            Self::Drive => 2,
+            Self::Impact => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CameraPathMode {
+    Auto,
+    Orbit,
+    Dolly,
+    Helix,
+    Spiral,
+    Drift,
+}
+
+impl CameraPathMode {
+    const fn all() -> [Self; 6] {
+        [
+            Self::Auto,
+            Self::Orbit,
+            Self::Dolly,
+            Self::Helix,
+            Self::Spiral,
+            Self::Drift,
+        ]
+    }
+
+    fn next(self) -> Self {
+        let all = Self::all();
+        let mut idx = 0usize;
+        while idx < all.len() {
+            if all[idx] == self {
+                return all[(idx + 1) % all.len()];
+            }
+            idx += 1;
+        }
+        Self::Auto
+    }
+
+    fn prev(self) -> Self {
+        let all = Self::all();
+        let mut idx = 0usize;
+        while idx < all.len() {
+            if all[idx] == self {
+                return all[(idx + all.len() - 1) % all.len()];
+            }
+            idx += 1;
+        }
+        Self::Auto
+    }
+
+    fn step(self, forward: bool) -> Self {
+        if forward {
+            self.next()
+        } else {
+            self.prev()
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Orbit => "Orbit",
+            Self::Dolly => "Dolly",
+            Self::Helix => "Helix",
+            Self::Spiral => "Spiral",
+            Self::Drift => "Drift",
+        }
+    }
+}
+
 fn pick_kind(seed: u32, choices: &[TransitionKind], last: TransitionKind) -> TransitionKind {
     if choices.is_empty() {
         return TransitionKind::Fade;
     }
+    fn flavor(kind: TransitionKind) -> u8 {
+        match kind {
+            TransitionKind::Cut | TransitionKind::Flash => 0, // hard cuts
+            TransitionKind::Datamosh | TransitionKind::Echo => 1, // glitch
+            TransitionKind::Morph | TransitionKind::Remix => 2, // morph/remix
+            TransitionKind::Zoom
+            | TransitionKind::Radial
+            | TransitionKind::Swirl
+            | TransitionKind::Wipe
+            | TransitionKind::Prism => 3, // motion geometry
+            TransitionKind::Fade | TransitionKind::Dissolve | TransitionKind::Luma => 4, // soft blend
+        }
+    }
     let len = choices.len();
     let base = (seed as usize) % len;
+    let last_flavor = flavor(last);
+    // First pass: avoid immediate repeats and same-family repeats.
+    for off in 0..len {
+        let c = choices[(base + off) % len];
+        if c != last && (len <= 2 || flavor(c) != last_flavor) {
+            return c;
+        }
+    }
+    // Fallback: at least avoid exact repetition.
     for off in 0..len {
         let c = choices[(base + off) % len];
         if c != last || len == 1 {
@@ -140,6 +260,10 @@ fn pick_kind(seed: u32, choices: &[TransitionKind], last: TransitionKind) -> Tra
         }
     }
     choices[base]
+}
+
+fn is_hard_cut(kind: TransitionKind) -> bool {
+    matches!(kind, TransitionKind::Cut | TransitionKind::Flash)
 }
 
 fn step_transition_override(cur: Option<TransitionKind>, forward: bool) -> Option<TransitionKind> {
@@ -224,11 +348,22 @@ impl FractalZoomMode {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn suggest_transition(
     audio: &AudioFeatures,
     seed: u32,
     mode: TransitionMode,
     last: TransitionKind,
+) -> (Duration, TransitionKind) {
+    suggest_transition_for_section(audio, seed, mode, last, classify_scene_section(audio))
+}
+
+pub(crate) fn suggest_transition_for_section(
+    audio: &AudioFeatures,
+    seed: u32,
+    mode: TransitionMode,
+    last: TransitionKind,
+    section: SceneSection,
 ) -> (Duration, TransitionKind) {
     if mode != TransitionMode::Auto {
         let (base, span, pool): (u64, u64, &[TransitionKind]) = match mode {
@@ -294,110 +429,176 @@ pub(crate) fn suggest_transition(
         return (dur, pick_kind(seed.rotate_left(7), pool, last));
     }
 
-    // Auto heuristic:
-    // - hard transients -> quick hard cuts / glitches
-    // - smooth sections -> longer motion morph/remix
-    // - otherwise -> spectral profile chooses among mixed transitions
+    // Auto policy is section-driven so pacing and transition operators
+    // stay aligned with stable scene energy.
     let treb = (audio.bands[5] + audio.bands[6] + audio.bands[7]) * (1.0 / 3.0);
     let hit = audio.onset.max(audio.beat_strength).max(treb);
-
-    let hard = (audio.beat && audio.beat_strength > 0.62) || audio.onset > 0.70;
-    if hard {
-        let dur = if audio.beat_strength > 0.86 || audio.onset > 0.86 {
-            Duration::from_millis(70)
-        } else {
-            Duration::from_millis(120)
-        };
-        let noisy = treb > 0.42 || audio.flatness > 0.42;
-        let kind = if audio.onset > 0.90 || audio.beat_strength > 0.90 || (seed & 3) == 0 {
-            pick_kind(
-                seed ^ 0xE219_5A0D,
-                &[TransitionKind::Cut, TransitionKind::Flash, TransitionKind::Wipe],
+    let transient = audio.onset.max(audio.beat_strength);
+    let strong_transient =
+        transient > 0.84 || (audio.beat && audio.beat_strength > 0.78 && audio.onset > 0.42);
+    let very_strong_transient =
+        transient > 0.92 || (audio.beat && audio.beat_strength > 0.90 && audio.onset > 0.62);
+    match section {
+        SceneSection::Calm => {
+            let dur = Duration::from_millis(1500 + (seed as u64 % 980));
+            let kind = pick_kind(
+                seed ^ 0x9B54_4E2D,
+                &[
+                    TransitionKind::Morph,
+                    TransitionKind::Remix,
+                    TransitionKind::Echo,
+                    TransitionKind::Swirl,
+                    TransitionKind::Fade,
+                    TransitionKind::Luma,
+                ],
                 last,
-            )
-        } else if noisy || (seed & 1) == 0 {
-            pick_kind(
-                seed ^ 0xAC6A_C329,
-                &[TransitionKind::Datamosh, TransitionKind::Cut, TransitionKind::Echo],
+            );
+            (dur, kind)
+        }
+        SceneSection::Groove => {
+            if strong_transient && (seed & 3) == 0 {
+                let dur = Duration::from_millis(260 + (seed as u64 % 220));
+                let kind = pick_kind(
+                    seed ^ 0x4D81_1FC3,
+                    &[
+                        TransitionKind::Datamosh,
+                        TransitionKind::Wipe,
+                        TransitionKind::Radial,
+                        TransitionKind::Dissolve,
+                        TransitionKind::Prism,
+                    ],
+                    last,
+                );
+                return (dur, kind);
+            }
+
+            let bass = audio.bands[1];
+            let kind = if treb > 0.58 && hit > 0.35 {
+                pick_kind(
+                    seed ^ 0x73A4_4C9B,
+                    &[
+                        TransitionKind::Morph,
+                        TransitionKind::Prism,
+                        TransitionKind::Dissolve,
+                        TransitionKind::Datamosh,
+                        TransitionKind::Luma,
+                    ],
+                    last,
+                )
+            } else if audio.centroid > 0.58 {
+                pick_kind(
+                    seed ^ 0x1F4C_0AB7,
+                    &[TransitionKind::Swirl, TransitionKind::Remix, TransitionKind::Zoom],
+                    last,
+                )
+            } else if bass > 0.55 || (seed % 7) == 0 {
+                pick_kind(
+                    seed ^ 0x0BD5_EE21,
+                    &[TransitionKind::Zoom, TransitionKind::Radial, TransitionKind::Wipe],
+                    last,
+                )
+            } else {
+                pick_kind(
+                    seed ^ 0xA536_993D,
+                    &[
+                        TransitionKind::Morph,
+                        TransitionKind::Remix,
+                        TransitionKind::Fade,
+                        TransitionKind::Luma,
+                    ],
+                    last,
+                )
+            };
+            let base = if hit < 0.26 { 920 } else { 780 };
+            (Duration::from_millis(base + (seed as u64 % 520)), kind)
+        }
+        SceneSection::Drive => {
+            let hard_slot = (seed & 15) == 0 || (very_strong_transient && (seed & 7) == 0);
+            if hard_slot && strong_transient {
+                let mut kind = if very_strong_transient {
+                    pick_kind(
+                        seed ^ 0xE219_5A0D,
+                        &[
+                            TransitionKind::Cut,
+                            TransitionKind::Flash,
+                            TransitionKind::Datamosh,
+                            TransitionKind::Wipe,
+                        ],
+                        last,
+                    )
+                } else {
+                    pick_kind(
+                        seed ^ 0x67CF_DA0B,
+                        &[
+                            TransitionKind::Datamosh,
+                            TransitionKind::Wipe,
+                            TransitionKind::Dissolve,
+                            TransitionKind::Radial,
+                        ],
+                        last,
+                    )
+                };
+                let mut dur = if very_strong_transient {
+                    Duration::from_millis(90 + (seed as u64 % 90))
+                } else {
+                    Duration::from_millis(140 + (seed as u64 % 140))
+                };
+                if is_hard_cut(kind) && is_hard_cut(last) && !very_strong_transient {
+                    kind = pick_kind(
+                        seed ^ 0xAC6A_C329,
+                        &[TransitionKind::Datamosh, TransitionKind::Wipe, TransitionKind::Radial],
+                        last,
+                    );
+                    dur = Duration::from_millis(220 + (seed as u64 % 220));
+                }
+                return (dur, kind);
+            }
+
+            let dur = Duration::from_millis(260 + (seed as u64 % 320));
+            let kind = pick_kind(
+                seed ^ 0x6DA1_47C5,
+                &[
+                    TransitionKind::Datamosh,
+                    TransitionKind::Wipe,
+                    TransitionKind::Radial,
+                    TransitionKind::Dissolve,
+                    TransitionKind::Prism,
+                    TransitionKind::Zoom,
+                ],
                 last,
-            )
-        } else {
-            pick_kind(
-                seed ^ 0x67CF_DA0B,
-                &[TransitionKind::Dissolve, TransitionKind::Radial],
+            );
+            (dur, kind)
+        }
+        SceneSection::Impact => {
+            let mut dur = if very_strong_transient {
+                Duration::from_millis(70 + (seed as u64 % 90))
+            } else {
+                Duration::from_millis(120 + (seed as u64 % 170))
+            };
+            let mut kind = pick_kind(
+                seed ^ 0x2E91_31B7,
+                &[
+                    TransitionKind::Cut,
+                    TransitionKind::Flash,
+                    TransitionKind::Datamosh,
+                    TransitionKind::Wipe,
+                    TransitionKind::Radial,
+                    TransitionKind::Dissolve,
+                    TransitionKind::Prism,
+                ],
                 last,
-            )
-        };
-        return (dur, kind);
+            );
+            if is_hard_cut(kind) && is_hard_cut(last) && !very_strong_transient {
+                kind = pick_kind(
+                    seed ^ 0xB41D_71AB,
+                    &[TransitionKind::Datamosh, TransitionKind::Wipe, TransitionKind::Radial],
+                    last,
+                );
+                dur = Duration::from_millis(180 + (seed as u64 % 180));
+            }
+            (dur, kind)
+        }
     }
-
-    let smooth = audio.onset < 0.10 && treb < 0.18;
-    if smooth {
-        let dur = Duration::from_millis(1600 + (seed as u64 % 900));
-        let kind = pick_kind(
-            seed ^ 0x9B54_4E2D,
-            &[
-                TransitionKind::Morph,
-                TransitionKind::Remix,
-                TransitionKind::Zoom,
-                TransitionKind::Swirl,
-                TransitionKind::Fade,
-            ],
-            last,
-        );
-        return (dur, kind);
-    }
-
-    if hit > 0.78 && audio.rms > 0.22 {
-        let dur = Duration::from_millis(180 + (seed as u64 % 230));
-        let kind = pick_kind(
-            seed ^ 0x4D81_1FC3,
-            &[
-                TransitionKind::Datamosh,
-                TransitionKind::Cut,
-                TransitionKind::Flash,
-                TransitionKind::Wipe,
-                TransitionKind::Radial,
-            ],
-            last,
-        );
-        return (dur, kind);
-    }
-
-    // Normal switching.
-    let bass = audio.bands[1];
-    let kind = if treb > 0.58 && hit > 0.35 {
-        pick_kind(
-            seed ^ 0x73A4_4C9B,
-            &[
-                TransitionKind::Morph,
-                TransitionKind::Prism,
-                TransitionKind::Dissolve,
-                TransitionKind::Datamosh,
-                TransitionKind::Luma,
-            ],
-            last,
-        )
-    } else if audio.centroid > 0.58 {
-        pick_kind(
-            seed ^ 0x1F4C_0AB7,
-            &[TransitionKind::Swirl, TransitionKind::Remix, TransitionKind::Zoom],
-            last,
-        )
-    } else if bass > 0.55 || (seed % 7) == 0 {
-        pick_kind(
-            seed ^ 0x0BD5_EE21,
-            &[TransitionKind::Zoom, TransitionKind::Radial, TransitionKind::Wipe],
-            last,
-        )
-    } else {
-        pick_kind(
-            seed ^ 0xA536_993D,
-            &[TransitionKind::Radial, TransitionKind::Fade, TransitionKind::Luma],
-            last,
-        )
-    };
-    (Duration::from_millis(760 + (seed as u64 % 460)), kind)
 }
 
 pub(crate) fn suggest_manual_transition(
@@ -472,9 +673,86 @@ pub(crate) fn is_fractal_preset_name(name: &str) -> bool {
         || n.contains("sdf")
 }
 
+#[allow(dead_code)]
 pub(crate) fn is_calm_section(audio: &AudioFeatures) -> bool {
+    classify_scene_section(audio) == SceneSection::Calm
+}
+
+pub(crate) fn classify_scene_section(audio: &AudioFeatures) -> SceneSection {
+    let bass = audio.bands[1].clamp(0.0, 1.0);
+    let mid = audio.bands[3].clamp(0.0, 1.0);
     let treb = (audio.bands[5] + audio.bands[6] + audio.bands[7]) * (1.0 / 3.0);
-    !audio.beat && audio.rms < 0.24 && audio.onset < 0.18 && treb < 0.34
+    let transient = audio.onset.max(audio.beat_strength).clamp(0.0, 1.0);
+    let pulse = (audio.rms * 0.42 + transient * 0.30 + bass * 0.18 + mid * 0.10).clamp(0.0, 1.0);
+
+    if pulse < 0.24 && transient < 0.21 && !audio.beat && treb < 0.34 {
+        SceneSection::Calm
+    } else if pulse > 0.78
+        || transient > 0.90
+        || (audio.beat && audio.beat_strength > 0.86 && audio.onset > 0.58)
+    {
+        SceneSection::Impact
+    } else if pulse > 0.54
+        || transient > 0.62
+        || (audio.beat && audio.beat_strength > 0.56)
+        || bass > 0.66
+    {
+        SceneSection::Drive
+    } else {
+        SceneSection::Groove
+    }
+}
+
+fn section_hysteresis_votes(from: SceneSection, to: SceneSection) -> u8 {
+    let delta = to.intensity_rank() - from.intensity_rank();
+    if delta >= 2 {
+        2
+    } else if delta > 0 {
+        3
+    } else if delta < 0 {
+        4
+    } else {
+        1
+    }
+}
+
+fn section_hysteresis_hold(from: SceneSection, to: SceneSection) -> Duration {
+    match (from, to) {
+        (SceneSection::Calm, SceneSection::Groove)
+        | (SceneSection::Groove, SceneSection::Drive)
+        | (SceneSection::Drive, SceneSection::Impact) => Duration::from_millis(650),
+        (SceneSection::Impact, SceneSection::Drive)
+        | (SceneSection::Drive, SceneSection::Groove)
+        | (SceneSection::Groove, SceneSection::Calm) => Duration::from_millis(1650),
+        _ => Duration::from_millis(1000),
+    }
+}
+
+fn section_time_scale(section: SceneSection) -> f32 {
+    match section {
+        SceneSection::Calm => 1.35,
+        SceneSection::Groove => 1.0,
+        SceneSection::Drive => 0.78,
+        SceneSection::Impact => 0.58,
+    }
+}
+
+fn section_beats_per_switch(base: u32, section: SceneSection) -> u32 {
+    match section {
+        SceneSection::Calm => base.saturating_add(2).max(1),
+        SceneSection::Groove => base.saturating_add(1).max(1),
+        SceneSection::Drive => base.max(1),
+        SceneSection::Impact => base.saturating_sub(1).max(1),
+    }
+}
+
+fn section_energy_gate(section: SceneSection) -> (f32, f32) {
+    match section {
+        SceneSection::Calm => (0.28, 12.0),
+        SceneSection::Groove => (0.34, 8.8),
+        SceneSection::Drive => (0.40, 6.2),
+        SceneSection::Impact => (0.46, 4.6),
+    }
 }
 
 pub trait VisualEngine {
@@ -485,11 +763,32 @@ pub trait VisualEngine {
     fn toggle_shuffle(&mut self);
     fn cycle_transition_mode(&mut self);
     fn transition_mode(&self) -> TransitionMode;
+    fn transition_mode_name(&self) -> &'static str {
+        self.transition_mode().label()
+    }
     fn transition_kind_name(&self) -> &'static str;
+    fn transition_operator_name(&self) -> &'static str {
+        self.transition_kind_name()
+    }
     fn transition_selection_name(&self) -> &'static str;
     fn transition_selection_locked(&self) -> bool;
     fn next_transition_kind(&mut self);
     fn prev_transition_kind(&mut self);
+    fn scene_section_name(&self) -> &'static str {
+        SceneSection::Groove.label()
+    }
+    fn cycle_camera_path_mode(&mut self) {}
+    fn step_camera_path_mode(&mut self, _forward: bool) {}
+    fn camera_path_mode(&self) -> CameraPathMode {
+        CameraPathMode::Auto
+    }
+    fn camera_path_mode_name(&self) -> &'static str {
+        self.camera_path_mode().label()
+    }
+    fn step_camera_path_speed(&mut self, _delta: f32) {}
+    fn camera_path_speed(&self) -> f32 {
+        1.0
+    }
     fn toggle_fractal_bias(&mut self);
     fn fractal_bias(&self) -> bool;
     fn cycle_fractal_zoom_mode(&mut self);
@@ -532,6 +831,12 @@ pub struct PresetEngine {
     fractal_zoom_drive: f32,
     fractal_zoom_enabled: bool,
     fractal_bias: bool,
+    scene_section: SceneSection,
+    scene_section_pending: SceneSection,
+    scene_section_votes: u8,
+    scene_section_changed_at: Instant,
+    camera_path_mode: CameraPathMode,
+    camera_path_speed: f32,
 
     // Buffers
     front: Vec<u8>,
@@ -581,6 +886,12 @@ impl PresetEngine {
             fractal_zoom_drive: 1.0,
             fractal_zoom_enabled: true,
             fractal_bias: false,
+            scene_section: SceneSection::Groove,
+            scene_section_pending: SceneSection::Groove,
+            scene_section_votes: 0,
+            scene_section_changed_at: now,
+            camera_path_mode: CameraPathMode::Auto,
+            camera_path_speed: 1.0,
             front: Vec::new(),
             back: Vec::new(),
             tmp_a: Vec::new(),
@@ -666,8 +977,16 @@ impl PresetEngine {
         self.transition_mode
     }
 
+    pub fn transition_mode_name(&self) -> &'static str {
+        self.transition_mode.label()
+    }
+
     pub fn transition_kind_name(&self) -> &'static str {
         self.transition_kind.label()
+    }
+
+    pub fn transition_operator_name(&self) -> &'static str {
+        self.transition_kind.operator_label()
     }
 
     pub fn transition_selection_name(&self) -> &'static str {
@@ -688,6 +1007,34 @@ impl PresetEngine {
 
     pub fn prev_transition_kind(&mut self) {
         self.transition_override = step_transition_override(self.transition_override, false);
+    }
+
+    pub fn scene_section_name(&self) -> &'static str {
+        self.scene_section.label()
+    }
+
+    pub fn cycle_camera_path_mode(&mut self) {
+        self.camera_path_mode = self.camera_path_mode.next();
+    }
+
+    pub fn step_camera_path_mode(&mut self, forward: bool) {
+        self.camera_path_mode = self.camera_path_mode.step(forward);
+    }
+
+    pub fn camera_path_mode(&self) -> CameraPathMode {
+        self.camera_path_mode
+    }
+
+    pub fn camera_path_mode_name(&self) -> &'static str {
+        self.camera_path_mode.label()
+    }
+
+    pub fn step_camera_path_speed(&mut self, delta: f32) {
+        self.camera_path_speed = (self.camera_path_speed + delta).clamp(0.15, 4.0);
+    }
+
+    pub fn camera_path_speed(&self) -> f32 {
+        self.camera_path_speed
     }
 
     pub fn toggle_fractal_bias(&mut self) {
@@ -885,18 +1232,19 @@ impl PresetEngine {
         };
         if self.fractal_bias
             && self.switch_mode == SwitchMode::Adaptive
-            && is_calm_section(audio)
+            && self.scene_section == SceneSection::Calm
             && fastrand::f32() < 0.78
         {
             if let Some(fr) = self.pick_fractal_index() {
                 next = fr;
             }
         }
-        let (mut dur, mut kind) = suggest_transition(
+        let (mut dur, mut kind) = suggest_transition_for_section(
             audio,
             fastrand::u32(..),
             self.transition_mode,
             self.last_transition_kind,
+            self.scene_section,
         );
         if let Some(k) = self.transition_override {
             kind = k;
@@ -905,7 +1253,34 @@ impl PresetEngine {
         self.start_transition_with_dur(next, dur, kind);
     }
 
+    fn update_scene_section_state(&mut self, now: Instant, audio: &AudioFeatures) {
+        let candidate = classify_scene_section(audio);
+        if candidate == self.scene_section {
+            self.scene_section_pending = candidate;
+            self.scene_section_votes = 0;
+            return;
+        }
+        if candidate != self.scene_section_pending {
+            self.scene_section_pending = candidate;
+            self.scene_section_votes = 1;
+            return;
+        }
+        self.scene_section_votes = self.scene_section_votes.saturating_add(1);
+        let min_votes = section_hysteresis_votes(self.scene_section, candidate);
+        let min_hold = section_hysteresis_hold(self.scene_section, candidate);
+        if self.scene_section_votes >= min_votes
+            && now.duration_since(self.scene_section_changed_at) >= min_hold
+        {
+            self.scene_section = candidate;
+            self.scene_section_pending = candidate;
+            self.scene_section_votes = 0;
+            self.scene_section_changed_at = now;
+        }
+    }
+
     pub fn update_auto_switch(&mut self, now: Instant, audio: &AudioFeatures) {
+        self.update_scene_section_state(now, audio);
+
         if self.switch_mode == SwitchMode::Manual {
             return;
         }
@@ -918,20 +1293,24 @@ impl PresetEngine {
             SwitchMode::Beat => {
                 if audio.beat {
                     self.beat_counter = self.beat_counter.wrapping_add(1);
-                    if self.beat_counter % self.beats_per_switch == 0 {
+                    let beats_per = section_beats_per_switch(self.beats_per_switch, self.scene_section);
+                    if self.beat_counter % beats_per == 0 {
                         self.next_preset_auto(audio);
                     }
                 }
             }
             SwitchMode::Energy => {
-                // Simple heuristic: switch if energy stays high for a while.
                 let e = audio.rms;
-                if e > 0.45 && now.duration_since(self.last_switch).as_secs_f32() > 8.0 {
+                let since = now.duration_since(self.last_switch).as_secs_f32();
+                let (energy_gate, min_since) = section_energy_gate(self.scene_section);
+                if e > energy_gate && since > min_since {
                     self.next_preset_auto(audio);
                 }
             }
             SwitchMode::Time => {
-                if now.duration_since(self.last_switch).as_secs_f32() > self.seconds_per_switch {
+                let target = (self.seconds_per_switch * section_time_scale(self.scene_section))
+                    .clamp(2.0, 60.0);
+                if now.duration_since(self.last_switch).as_secs_f32() > target {
                     self.next_preset_auto(audio);
                 }
             }
@@ -942,11 +1321,30 @@ impl PresetEngine {
                 let hit = audio.onset.max(audio.beat_strength).max(treb);
                 let e = audio.rms;
 
-                let mut target = self.seconds_per_switch * (1.25 - 0.7 * e) * (1.10 - 0.55 * hit);
-                target = target.clamp(4.0, 28.0);
+                let pace_scale = section_time_scale(self.scene_section);
+                let mut target =
+                    self.seconds_per_switch * pace_scale * (1.25 - 0.7 * e) * (1.10 - 0.55 * hit);
+                target = match self.scene_section {
+                    SceneSection::Calm => target.clamp(5.5, 32.0),
+                    SceneSection::Groove => target.clamp(4.0, 28.0),
+                    SceneSection::Drive => target.clamp(3.2, 22.0),
+                    SceneSection::Impact => target.clamp(2.2, 15.0),
+                };
 
-                let min_since = 2.8;
-                let slam = (audio.beat && audio.beat_strength > 0.82) || audio.onset > 0.78;
+                let min_since = match self.scene_section {
+                    SceneSection::Calm => 3.4,
+                    SceneSection::Groove => 2.8,
+                    SceneSection::Drive => 2.2,
+                    SceneSection::Impact => 1.6,
+                };
+                let slam_gate = match self.scene_section {
+                    SceneSection::Calm => 0.88,
+                    SceneSection::Groove => 0.84,
+                    SceneSection::Drive => 0.80,
+                    SceneSection::Impact => 0.74,
+                };
+                let slam =
+                    (audio.beat && audio.beat_strength > slam_gate) || audio.onset > (slam_gate - 0.04);
                 if slam && since > min_since {
                     self.next_preset_auto(audio);
                 } else if since > target {
@@ -1044,8 +1442,16 @@ impl VisualEngine for PresetEngine {
         PresetEngine::transition_mode(self)
     }
 
+    fn transition_mode_name(&self) -> &'static str {
+        PresetEngine::transition_mode_name(self)
+    }
+
     fn transition_kind_name(&self) -> &'static str {
         PresetEngine::transition_kind_name(self)
+    }
+
+    fn transition_operator_name(&self) -> &'static str {
+        PresetEngine::transition_operator_name(self)
     }
 
     fn transition_selection_name(&self) -> &'static str {
@@ -1062,6 +1468,34 @@ impl VisualEngine for PresetEngine {
 
     fn prev_transition_kind(&mut self) {
         PresetEngine::prev_transition_kind(self)
+    }
+
+    fn scene_section_name(&self) -> &'static str {
+        PresetEngine::scene_section_name(self)
+    }
+
+    fn cycle_camera_path_mode(&mut self) {
+        PresetEngine::cycle_camera_path_mode(self)
+    }
+
+    fn step_camera_path_mode(&mut self, forward: bool) {
+        PresetEngine::step_camera_path_mode(self, forward)
+    }
+
+    fn camera_path_mode(&self) -> CameraPathMode {
+        PresetEngine::camera_path_mode(self)
+    }
+
+    fn camera_path_mode_name(&self) -> &'static str {
+        PresetEngine::camera_path_mode_name(self)
+    }
+
+    fn step_camera_path_speed(&mut self, delta: f32) {
+        PresetEngine::step_camera_path_speed(self, delta)
+    }
+
+    fn camera_path_speed(&self) -> f32 {
+        PresetEngine::camera_path_speed(self)
     }
 
     fn toggle_fractal_bias(&mut self) {

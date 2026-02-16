@@ -1,9 +1,10 @@
 use crate::audio::AudioFeatures;
 use crate::config::{Quality, SwitchMode};
 use crate::visual::{
-    is_calm_section, is_fractal_preset_name, suggest_manual_transition, suggest_transition,
-    transition_base_duration, transition_duration_for_kind, FractalZoomMode, RenderCtx,
-    TransitionKind, TransitionMode, VisualEngine,
+    classify_scene_section, is_fractal_preset_name, suggest_manual_transition,
+    suggest_transition_for_section, transition_base_duration, transition_duration_for_kind,
+    CameraPathMode, FractalZoomMode, RenderCtx, SceneSection, TransitionKind, TransitionMode,
+    VisualEngine,
 };
 use anyhow::{anyhow, Context};
 use metal::*;
@@ -36,6 +37,8 @@ struct Uniforms {
     safe: u32,
     quality: u32,
     has_prev: u32,
+    camera_path_mode: u32,
+    camera_path_speed: f32,
 }
 
 pub struct MetalEngine {
@@ -61,6 +64,12 @@ pub struct MetalEngine {
     fractal_zoom_drive: f32,
     fractal_zoom_enabled: bool,
     fractal_bias: bool,
+    scene_section: SceneSection,
+    scene_section_pending: SceneSection,
+    scene_section_votes: u8,
+    scene_section_changed_at: Instant,
+    camera_path_mode: CameraPathMode,
+    camera_path_speed: f32,
 
     device: Device,
     queue: CommandQueue,
@@ -157,6 +166,12 @@ impl MetalEngine {
             fractal_zoom_drive: 1.0,
             fractal_zoom_enabled: true,
             fractal_bias: false,
+            scene_section: SceneSection::Groove,
+            scene_section_pending: SceneSection::Groove,
+            scene_section_votes: 0,
+            scene_section_changed_at: now,
+            camera_path_mode: CameraPathMode::Auto,
+            camera_path_speed: 1.0,
             device,
             queue,
             pipeline,
@@ -276,24 +291,50 @@ impl MetalEngine {
         };
         if self.fractal_bias
             && self.switch_mode == SwitchMode::Adaptive
-            && is_calm_section(audio)
+            && self.scene_section == SceneSection::Calm
             && fastrand::f32() < 0.78
         {
             if let Some(fr) = self.pick_fractal_index() {
                 next = fr;
             }
         }
-        let (mut dur, mut kind) = suggest_transition(
+        let (mut dur, mut kind) = suggest_transition_for_section(
             audio,
             fastrand::u32(..),
             self.transition_mode,
             self.last_transition_kind,
+            self.scene_section,
         );
         if let Some(k) = self.transition_override {
             kind = k;
             dur = transition_duration_for_kind(kind, audio);
         }
         self.start_transition_with_dur(next, dur, kind);
+    }
+
+    fn update_scene_section_state(&mut self, now: Instant, audio: &AudioFeatures) {
+        let candidate = classify_scene_section(audio);
+        if candidate == self.scene_section {
+            self.scene_section_pending = candidate;
+            self.scene_section_votes = 0;
+            return;
+        }
+        if candidate != self.scene_section_pending {
+            self.scene_section_pending = candidate;
+            self.scene_section_votes = 1;
+            return;
+        }
+        self.scene_section_votes = self.scene_section_votes.saturating_add(1);
+        let min_votes = metal_section_hysteresis_votes(self.scene_section, candidate);
+        let min_hold = metal_section_hysteresis_hold(self.scene_section, candidate);
+        if self.scene_section_votes >= min_votes
+            && now.duration_since(self.scene_section_changed_at) >= min_hold
+        {
+            self.scene_section = candidate;
+            self.scene_section_pending = candidate;
+            self.scene_section_votes = 0;
+            self.scene_section_changed_at = now;
+        }
     }
 
     fn pick_fractal_index(&mut self) -> Option<usize> {
@@ -408,6 +449,10 @@ impl VisualEngine for MetalEngine {
         self.transition_override.is_some()
     }
 
+    fn scene_section_name(&self) -> &'static str {
+        self.scene_section.label()
+    }
+
     fn next_transition_kind(&mut self) {
         self.transition_override = match self.transition_override {
             None => Some(TransitionKind::all()[0]),
@@ -444,6 +489,30 @@ impl VisualEngine for MetalEngine {
 
     fn fractal_bias(&self) -> bool {
         self.fractal_bias
+    }
+
+    fn cycle_camera_path_mode(&mut self) {
+        self.camera_path_mode = self.camera_path_mode.next();
+    }
+
+    fn step_camera_path_mode(&mut self, forward: bool) {
+        self.camera_path_mode = self.camera_path_mode.step(forward);
+    }
+
+    fn camera_path_mode(&self) -> CameraPathMode {
+        self.camera_path_mode
+    }
+
+    fn camera_path_mode_name(&self) -> &'static str {
+        self.camera_path_mode.label()
+    }
+
+    fn step_camera_path_speed(&mut self, delta: f32) {
+        self.camera_path_speed = (self.camera_path_speed + delta).clamp(0.15, 4.0);
+    }
+
+    fn camera_path_speed(&self) -> f32 {
+        self.camera_path_speed
     }
 
     fn cycle_fractal_zoom_mode(&mut self) {
@@ -530,6 +599,8 @@ impl VisualEngine for MetalEngine {
     }
 
     fn update_auto_switch(&mut self, now: Instant, audio: &AudioFeatures) {
+        self.update_scene_section_state(now, audio);
+
         if self.switch_mode == SwitchMode::Manual {
             return;
         }
@@ -542,19 +613,26 @@ impl VisualEngine for MetalEngine {
             SwitchMode::Beat => {
                 if audio.beat {
                     self.beat_counter = self.beat_counter.wrapping_add(1);
-                    if self.beat_counter % self.beats_per_switch == 0 {
+                    let beats_per =
+                        metal_section_beats_per_switch(self.beats_per_switch, self.scene_section);
+                    if self.beat_counter % beats_per == 0 {
                         self.next_preset_auto(audio);
                     }
                 }
             }
             SwitchMode::Energy => {
                 let e = audio.rms;
-                if e > 0.45 && now.duration_since(self.last_switch).as_secs_f32() > 8.0 {
+                let since = now.duration_since(self.last_switch).as_secs_f32();
+                let (energy_gate, min_since) = metal_section_energy_gate(self.scene_section);
+                if e > energy_gate && since > min_since {
                     self.next_preset_auto(audio);
                 }
             }
             SwitchMode::Time => {
-                if now.duration_since(self.last_switch).as_secs_f32() > self.seconds_per_switch {
+                let target =
+                    (self.seconds_per_switch * metal_section_time_scale(self.scene_section))
+                        .clamp(2.0, 60.0);
+                if now.duration_since(self.last_switch).as_secs_f32() > target {
                     self.next_preset_auto(audio);
                 }
             }
@@ -564,11 +642,30 @@ impl VisualEngine for MetalEngine {
                 let hit = audio.onset.max(audio.beat_strength).max(treb);
                 let e = audio.rms;
 
-                let mut target = self.seconds_per_switch * (1.25 - 0.7 * e) * (1.10 - 0.55 * hit);
-                target = target.clamp(4.0, 28.0);
+                let pace_scale = metal_section_time_scale(self.scene_section);
+                let mut target =
+                    self.seconds_per_switch * pace_scale * (1.25 - 0.7 * e) * (1.10 - 0.55 * hit);
+                target = match self.scene_section {
+                    SceneSection::Calm => target.clamp(5.5, 32.0),
+                    SceneSection::Groove => target.clamp(4.0, 28.0),
+                    SceneSection::Drive => target.clamp(3.2, 22.0),
+                    SceneSection::Impact => target.clamp(2.2, 15.0),
+                };
 
-                let min_since = 2.8;
-                let slam = (audio.beat && audio.beat_strength > 0.82) || audio.onset > 0.78;
+                let min_since = match self.scene_section {
+                    SceneSection::Calm => 3.4,
+                    SceneSection::Groove => 2.8,
+                    SceneSection::Drive => 2.2,
+                    SceneSection::Impact => 1.6,
+                };
+                let slam_gate = match self.scene_section {
+                    SceneSection::Calm => 0.88,
+                    SceneSection::Groove => 0.84,
+                    SceneSection::Drive => 0.80,
+                    SceneSection::Impact => 0.74,
+                };
+                let slam =
+                    (audio.beat && audio.beat_strength > slam_gate) || audio.onset > (slam_gate - 0.04);
                 if slam && since > min_since {
                     self.next_preset_auto(audio);
                 } else if since > target {
@@ -637,6 +734,8 @@ impl VisualEngine for MetalEngine {
             safe: if ctx.safe { 1 } else { 0 },
             quality: Self::quality_u32(quality),
             has_prev: if self.has_prev { 1 } else { 0 },
+            camera_path_mode: self.camera_path_mode as u32,
+            camera_path_speed: self.camera_path_speed,
         };
 
         unsafe {
@@ -746,6 +845,69 @@ impl VisualEngine for MetalEngine {
     }
 }
 
+fn metal_section_hysteresis_votes(from: SceneSection, to: SceneSection) -> u8 {
+    let from_rank = metal_section_intensity_rank(from);
+    let to_rank = metal_section_intensity_rank(to);
+    let delta = to_rank - from_rank;
+    if delta >= 2 {
+        2
+    } else if delta > 0 {
+        3
+    } else if delta < 0 {
+        4
+    } else {
+        1
+    }
+}
+
+fn metal_section_hysteresis_hold(from: SceneSection, to: SceneSection) -> Duration {
+    match (from, to) {
+        (SceneSection::Calm, SceneSection::Groove)
+        | (SceneSection::Groove, SceneSection::Drive)
+        | (SceneSection::Drive, SceneSection::Impact) => Duration::from_millis(650),
+        (SceneSection::Impact, SceneSection::Drive)
+        | (SceneSection::Drive, SceneSection::Groove)
+        | (SceneSection::Groove, SceneSection::Calm) => Duration::from_millis(1650),
+        _ => Duration::from_millis(1000),
+    }
+}
+
+fn metal_section_time_scale(section: SceneSection) -> f32 {
+    match section {
+        SceneSection::Calm => 1.35,
+        SceneSection::Groove => 1.0,
+        SceneSection::Drive => 0.78,
+        SceneSection::Impact => 0.58,
+    }
+}
+
+fn metal_section_beats_per_switch(base: u32, section: SceneSection) -> u32 {
+    match section {
+        SceneSection::Calm => base.saturating_add(2).max(1),
+        SceneSection::Groove => base.saturating_add(1).max(1),
+        SceneSection::Drive => base.max(1),
+        SceneSection::Impact => base.saturating_sub(1).max(1),
+    }
+}
+
+fn metal_section_energy_gate(section: SceneSection) -> (f32, f32) {
+    match section {
+        SceneSection::Calm => (0.28, 12.0),
+        SceneSection::Groove => (0.34, 8.8),
+        SceneSection::Drive => (0.40, 6.2),
+        SceneSection::Impact => (0.46, 4.6),
+    }
+}
+
+const fn metal_section_intensity_rank(section: SceneSection) -> i8 {
+    match section {
+        SceneSection::Calm => 0,
+        SceneSection::Groove => 1,
+        SceneSection::Drive => 2,
+        SceneSection::Impact => 3,
+    }
+}
+
 fn make_resources(
     device: &Device,
     w: usize,
@@ -803,6 +965,8 @@ struct Uniforms {
     uint safe;
     uint quality;
     uint has_prev;
+    uint camera_path_mode;
+    float camera_path_speed;
 };
 
 static inline float3 pal(float t, float3 a, float3 b, float3 c, float3 d) {
@@ -896,9 +1060,10 @@ static inline float deep_zoom_pow(float t, float speed, float zm, float beat, fl
         return base;
     }
     float z = clamp(zm, 0.35, 2.5);
-    float phase = fract(t * (0.12 + 0.22*speed) * z + beat * 0.04);
-    float e = phase * phase * (3.0 - 2.0 * phase);
-    return base + span * e;
+    float sweep = max(t, 0.0) * (0.12 + 0.22*max(speed, 0.0)) * z;
+    sweep *= 1.0 + 0.55 * clamp(beat, 0.0, 1.0);
+    float lz = log2(1.0 + sweep);
+    return base + span * 0.12 * lz;
 }
 
 static inline float fractal_motion_zoom(float t, float zoom_mul, float bass, float beat) {
@@ -906,9 +1071,9 @@ static inline float fractal_motion_zoom(float t, float zoom_mul, float bass, flo
         return 1.0;
     }
     float zm = clamp(zoom_mul, 0.35, 2.5);
-    float phase = fract(t * (0.11 + 0.09*bass) * zm + beat * 0.05);
-    float e = phase * phase * (3.0 - 2.0 * phase);
-    return 0.95 + (1.0 + 2.2*zm) * e;
+    float rate = max(0.01, 0.09 + 0.07*bass) * zm * (1.0 + 0.45*clamp(beat, 0.0, 1.0));
+    float lz = log2(1.0 + max(t, 0.0) * rate);
+    return 1.0 + (0.75 + 1.65*zm) * lz;
 }
 
 static inline bool is_fractal_preset(uint preset) {
@@ -919,7 +1084,200 @@ static inline bool is_fractal_preset(uint preset) {
 
 static inline bool is_camera_travel_preset(uint preset) {
     uint p = preset % 56u;
-    return (p == 2u) || (p == 3u) || (p == 11u) || (p == 20u) || (p == 21u) || (p == 38u);
+    return (p == 2u) || (p == 3u) || (p == 11u) || (p == 20u) || (p == 21u) ||
+           (p >= 38u && p <= 45u) || (p == 49u) || (p == 50u) || (p == 54u) || (p == 55u);
+}
+
+// 0=auto, 1=orbit, 2=dolly, 3=helix, 4=spiral, 5=drift
+static inline uint camera_path_mode_for_preset(uint preset) {
+    switch (preset % 56u) {
+        case 2u:
+        case 41u:
+        case 49u:
+            return 2u; // dolly
+        case 3u:
+        case 42u:
+        case 43u:
+            return 1u; // orbit
+        case 11u:
+        case 21u:
+        case 45u:
+            return 3u; // helix
+        case 20u:
+        case 44u:
+        case 54u:
+            return 4u; // spiral
+        case 38u:
+        case 39u:
+        case 40u:
+        case 50u:
+        case 55u:
+            return 5u; // drift
+        default:
+            return 0u; // auto
+    }
+}
+
+struct CameraPathState {
+    float2 drift;
+    float zoom;
+    float spin;
+};
+
+static inline CameraPathState make_camera_state(float2 drift, float zoom, float spin) {
+    CameraPathState s;
+    s.drift = drift;
+    s.zoom = max(zoom, 1.0);
+    s.spin = spin;
+    return s;
+}
+
+static inline CameraPathState camera_auto_state(
+    float t,
+    float motion,
+    float transient,
+    float bass,
+    float mid,
+    float treb,
+    float beat,
+    float zoom_mul
+) {
+    float zm = clamp(zoom_mul, 0.35, 8.0);
+    float rate = max(0.01, 0.08 + 0.11*motion) * zm * (1.0 + 0.26*transient);
+    float lz = log2(1.0 + max(t, 0.0) * rate);
+    float phase = t*(0.26 + 0.22*motion + 0.04*transient) + 1.4*bass + 0.9*mid + 0.7*treb;
+
+    float w_orbit = smoothstep(0.15, 0.95, 0.55*mid + 0.30*treb + 0.20*motion);
+    float w_dolly = smoothstep(0.14, 0.92, 0.62*bass + 0.38*transient);
+    float w_helix = smoothstep(0.18, 0.96, 0.50*mid + 0.28*transient + 0.22*bass);
+    float w_spiral = smoothstep(0.20, 0.96, 0.58*treb + 0.25*motion + 0.17*beat);
+    float w_drift = smoothstep(0.10, 0.90, 0.58*(1.0 - transient) + 0.25*(1.0 - beat) + 0.17*motion);
+    float w_sum = max(w_orbit + w_dolly + w_helix + w_spiral + w_drift, 1e-4);
+    w_orbit /= w_sum;
+    w_dolly /= w_sum;
+    w_helix /= w_sum;
+    w_spiral /= w_sum;
+    w_drift /= w_sum;
+
+    float2 orbit = (0.020 + 0.060*(0.35 + 0.65*lz)) * float2(
+        sin(phase),
+        cos(phase*1.07 + 0.5*mid)
+    );
+    float2 helix = (0.018 + 0.050*(0.30 + 0.70*lz)) * float2(
+        sin(phase*1.23 + 1.3*treb),
+        cos(phase*1.11 - 1.0*bass)
+    );
+    float2 spiral = (0.014 + 0.044*(0.40 + 0.60*lz)) * float2(
+        cos(phase*1.37),
+        sin(phase*1.37)
+    );
+    float2 drift = (0.010 + 0.028*(0.45 + 0.55*lz)) * float2(
+        sin(t*(0.39 + 0.08*mid) + 2.4*treb + 1.7*transient) + 0.45*sin(t*0.91 + 2.1*bass),
+        cos(t*(0.33 + 0.09*bass) + 1.8*mid - 1.9*transient) + 0.40*cos(t*0.79 - 2.3*treb)
+    );
+
+    float2 d = w_orbit*orbit + w_helix*helix + w_spiral*(spiral + 0.35*orbit) + w_drift*drift;
+    float zoom = 1.0 + (0.30 + 1.10*w_dolly + 0.50*w_helix + 0.28*w_spiral) * (0.65 + 1.05*zm) * lz;
+    zoom = clamp(zoom, 1.0, 52.0);
+    float spin = 0.08*w_orbit*sin(phase*0.63) +
+                 0.12*w_helix*sin(phase*0.74) +
+                 0.15*w_spiral*sin(phase*0.58 + 1.2*bass) +
+                 0.05*w_drift*sin(t*0.31 + 2.0*treb);
+    spin = clamp(spin, -0.55, 0.55);
+    return make_camera_state(d, zoom, spin);
+}
+
+static inline CameraPathState camera_state_for_mode(
+    uint mode,
+    float t,
+    float motion,
+    float transient,
+    float bass,
+    float mid,
+    float treb,
+    float beat,
+    float zoom_mul
+) {
+    float zm = clamp(zoom_mul, 0.35, 8.0);
+    float rate = max(0.01, 0.08 + 0.11*motion) * zm * (1.0 + 0.26*transient);
+    float lz = log2(1.0 + max(t, 0.0) * rate);
+    float phase = t*(0.22 + 0.16*motion + 0.05*transient) + 1.6*bass + 0.8*mid + 0.5*treb;
+
+    switch (mode) {
+        case 1u: { // orbit
+            float2 drift = (0.020 + 0.060*(0.35 + 0.65*lz)) * float2(
+                sin(phase),
+                cos(phase*1.07 + 0.5*mid)
+            );
+            float zoom = clamp(1.0 + (0.46 + 0.78*zm) * lz * (1.0 + 0.10*mid), 1.0, 46.0);
+            float spin = 0.11 * sin(phase*0.72 + 0.4*treb);
+            return make_camera_state(drift, zoom, spin);
+        }
+        case 2u: { // dolly
+            float2 drift = (0.010 + 0.028*(0.4 + 0.6*lz)) * float2(
+                sin(t*(0.31 + 0.08*mid) + 0.7*bass),
+                cos(t*(0.27 + 0.08*bass) + 0.6*treb)
+            );
+            float zoom = clamp(1.0 + (1.12 + 1.46*zm) * lz * (1.0 + 0.10*bass), 1.0, 56.0);
+            float spin = 0.04 * sin(phase*0.41 + 0.8*mid);
+            return make_camera_state(drift, zoom, spin);
+        }
+        case 3u: { // helix
+            float helix_r = (0.016 + 0.055*(0.30 + 0.70*lz)) * (1.0 + 0.40*motion);
+            float2 drift = helix_r * float2(
+                sin(phase*1.22 + 1.5*treb),
+                cos(phase*1.04 - 1.2*bass)
+            );
+            float zoom = clamp(1.0 + (0.82 + 1.10*zm) * lz * (1.0 + 0.08*mid), 1.0, 50.0);
+            float spin = clamp(0.12 * sin(phase*0.76) + 0.08*lz, -0.60, 0.60);
+            return make_camera_state(drift, zoom, spin);
+        }
+        case 4u: { // spiral
+            float spiral_r = (0.018 + 0.062*motion) * (0.36 + 0.64*lz);
+            float2 drift = spiral_r * float2(
+                cos(phase*1.36 + 0.8*bass),
+                sin(phase*1.36 + 0.8*bass)
+            );
+            float zoom = clamp(1.0 + (0.70 + 1.04*zm) * lz * (1.0 + 0.11*treb), 1.0, 50.0);
+            float spin = clamp(0.18 * sin(phase*0.58 + 0.8*treb), -0.70, 0.70);
+            return make_camera_state(drift, zoom, spin);
+        }
+        case 5u: { // drift
+            float2 drift = (0.014 + 0.040*(0.38 + 0.62*lz)) * float2(
+                sin(t*(0.43 + 0.06*motion) + 2.0*treb + 1.3*transient) + 0.45*sin(t*0.93 + 2.4*bass),
+                cos(t*(0.37 + 0.08*motion) + 1.6*mid - 1.2*transient) + 0.40*cos(t*0.86 - 2.1*treb)
+            );
+            float zoom = clamp(1.0 + (0.54 + 0.78*zm) * lz * (1.0 + 0.08*motion), 1.0, 44.0);
+            float spin = clamp(0.06*sin(t*(0.28 + 0.16*motion)) + 0.03*cos(t*0.41 + 2.7*treb), -0.50, 0.50);
+            return make_camera_state(drift, zoom, spin);
+        }
+        default:
+            return camera_auto_state(t, motion, transient, bass, mid, treb, beat, zoom_mul);
+    }
+}
+
+static inline float2 apply_camera_path(
+    float2 q,
+    float t,
+    float motion,
+    float transient,
+    float bass,
+    float mid,
+    float treb,
+    float beat,
+    float zoom_mul,
+    uint mode,
+    float path_mix
+) {
+    float m = clamp(path_mix, 0.0, 1.0);
+    if (m <= 0.0001) {
+        return q;
+    }
+    CameraPathState state = camera_state_for_mode(mode, t, motion, transient, bass, mid, treb, beat, zoom_mul);
+    float2 qq = q + state.drift * m;
+    qq = rot(qq, state.spin * m);
+    float z = mix(1.0, state.zoom, m);
+    return qq / max(z, 1e-4);
 }
 
 static inline float sphere_trace_scene(float3 ro, float3 rd, float t, float bass, float mid, float treb, uint mode) {
@@ -1735,6 +2093,21 @@ static inline float3 preset_color(uint preset, float2 p, float t, float bass, fl
     }
 }
 
+inline float smooth_transient_drive(float beat, float onset) {
+    float x = clamp(0.62*clamp(beat, 0.0, 1.0) + 0.38*clamp(onset, 0.0, 1.0), 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
+}
+
+inline float smooth_motion_drive(float bass, float mid, float treb, float beat, float onset) {
+    float groove = clamp(0.58*bass + 0.27*mid + 0.15*treb, 0.0, 1.0);
+    float pulse = clamp(beat, 0.0, 1.0);
+    float trans = clamp(onset, 0.0, 1.0);
+    float accent = max(pulse, trans);
+    float x = clamp(0.76*groove + 0.16*accent + 0.08*pulse, 0.0, 1.0);
+    float eased = x * x * (3.0 - 2.0 * x);
+    return clamp(eased * (0.90 + 0.20*accent), 0.0, 1.0);
+}
+
 kernel void visualize(
     texture2d<half, access::sample> prevTex [[texture(0)]],
     texture2d<half, access::write> outTex [[texture(1)]],
@@ -1759,29 +2132,60 @@ kernel void visualize(
     float pres = clamp(u.bands[7], 0.0, 1.0);
 
     float beat = clamp(u.beat_pulse, 0.0, 1.0);
+    float onset = clamp(u.onset, 0.0, 1.0);
     float energy = clamp(u.rms, 0.0, 1.0);
     float t = u.time;
+    float motion = smooth_motion_drive(bass, mid, treb, beat, onset);
+    float transient = smooth_transient_drive(beat, onset);
 
-    float wobble = 0.015 + 0.05*bass + 0.02*beat + 0.008*treb + 0.007*highmid;
+    float wobble = 0.012 + 0.034*motion + 0.015*transient + 0.008*treb + 0.006*highmid;
     float2 q = p;
     float2 pn_base = float2(p.x / max(aspect, 1e-5), p.y);
-    q += wobble * float2(sin(p.y*3.2 + t*1.5 + 8.0*treb), cos(p.x*3.0 - t*1.3 + 6.0*mid));
-    q = rot(q, 0.05*sin(t*0.2) + 0.18*bass);
+    q += wobble * float2(
+        sin(p.y*(3.0 + 0.8*motion) + t*(1.3 + 0.8*motion) + 7.0*treb + 2.0*transient),
+        cos(p.x*(2.8 + 0.6*motion) - t*(1.1 + 0.7*motion) + 5.0*mid - 1.8*transient)
+    );
+    q = rot(q, 0.04*sin(t*(0.18 + 0.10*motion)) + 0.12*motion + 0.05*transient);
 
     float alpha = clamp(u.transition_alpha, 0.0, 1.0);
 
     float2 q0 = q;
     float2 q1 = q;
-    bool cam_zoom = (u.fractal_zoom_mul > 0.0) &&
-        (is_camera_travel_preset(u.active_preset) || (alpha > 0.001 && is_camera_travel_preset(u.next_preset)));
-    if (cam_zoom) {
-        float zm = clamp(u.fractal_zoom_mul, 0.35, 8.0);
-        float phase = fract(t*(0.13 + 0.10*bass)*zm + beat*0.05);
-        float e = phase * phase * (3.0 - 2.0 * phase);
-        float zcam = exp2(e * (1.0 + 1.2*zm));
-        float2 drift = 0.08 * float2(sin(t*0.43 + 0.7*mid), cos(t*0.37 + 0.6*treb));
-        q0 = (q0 + drift * (1.0 - alpha)) / zcam;
-        q1 = (q1 + drift * alpha) / zcam;
+    bool travel0 = (u.fractal_zoom_mul > 0.0) && is_camera_travel_preset(u.active_preset);
+    bool travel1 = (u.fractal_zoom_mul > 0.0) && is_camera_travel_preset(u.next_preset);
+    if (travel0 || (alpha > 0.001 && travel1)) {
+        uint mode_override = min(u.camera_path_mode, 5u);
+        uint mode0 = (mode_override == 0u) ? camera_path_mode_for_preset(u.active_preset) : mode_override;
+        uint mode1 = (mode_override == 0u) ? camera_path_mode_for_preset(u.next_preset) : mode_override;
+        float path_speed = clamp(u.camera_path_speed, 0.15, 4.0);
+        float mix0 = travel0 ? (1.0 - alpha) : 0.0;
+        float mix1 = travel1 ? alpha : 0.0;
+        q0 = apply_camera_path(
+            q0,
+            t * path_speed,
+            motion,
+            transient,
+            bass,
+            mid,
+            treb,
+            beat,
+            u.fractal_zoom_mul,
+            mode0,
+            mix0
+        );
+        q1 = apply_camera_path(
+            q1,
+            t * path_speed,
+            motion,
+            transient,
+            bass,
+            mid,
+            treb,
+            beat,
+            u.fractal_zoom_mul,
+            mode1,
+            mix1
+        );
     }
     if (u.transition_kind == 1u) {
         // Zoom-through: old zooms out, new zooms in.
@@ -1978,6 +2382,21 @@ kernel void visualize(
     // Soft vignetting.
     float v = smoothstep(1.4, 0.2, length(p));
     out *= (0.45 + 0.65*v);
+
+    // Reactive post-FX: adaptive saturation, soft-knee highlights, and micro-grain.
+    float lum = dot(out, float3(0.2126, 0.7152, 0.0722));
+    float fx_drive = clamp(0.42*energy + 0.34*transient + 0.24*treb, 0.0, 1.0);
+    float sat = (u.safe != 0u) ? (0.94 + 0.20*fx_drive) : (0.98 + 0.32*fx_drive);
+    out = mix(float3(lum), out, clamp(sat, 0.82, 1.30));
+
+    float knee = (u.safe != 0u) ? 0.78 : 0.86;
+    float soft = (u.safe != 0u) ? 0.16 : 0.24;
+    float3 over = max(out - knee, 0.0);
+    out = out / (1.0 + over * soft);
+
+    float grain = hash21(float2((float)gid.x * 0.73 + t*17.0, (float)gid.y * 1.19 - t*13.0)) - 0.5;
+    float grain_amp = ((u.safe != 0u) ? 0.008 : 0.014) * (0.45 + 0.55*fx_drive);
+    out += grain * grain_amp;
 
     // Clamp for terminal brightness.
     out = clamp(out, 0.0, (u.safe != 0u) ? 0.92 : 1.0);

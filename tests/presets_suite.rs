@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use tui_visualizer::audio::AudioFeatures;
 use tui_visualizer::config::{Quality, SwitchMode};
-use tui_visualizer::visual::{make_presets, Preset, PresetEngine, RenderCtx};
+use tui_visualizer::visual::{make_presets, CameraPathMode, Preset, PresetEngine, RenderCtx};
 
 fn synth_audio(t: f32, step: usize) -> AudioFeatures {
     let bass = ((t * 2.0).sin() * 0.5 + 0.5).powf(1.1);
@@ -34,6 +34,18 @@ fn synth_audio(t: f32, step: usize) -> AudioFeatures {
 fn has_non_black(buf: &[u8]) -> bool {
     buf.chunks_exact(4)
         .any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+}
+
+fn mean_abs_rgb_diff(a: &[u8], b: &[u8]) -> f32 {
+    let mut total = 0.0f32;
+    let mut n = 0usize;
+    for (pa, pb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        total += (pa[0] as f32 - pb[0] as f32).abs();
+        total += (pa[1] as f32 - pb[1] as f32).abs();
+        total += (pa[2] as f32 - pb[2] as f32).abs();
+        n += 3;
+    }
+    if n == 0 { 0.0 } else { total / n as f32 }
 }
 
 #[test]
@@ -127,4 +139,133 @@ fn adaptive_auto_mode_switches_presets() {
     }
 
     assert!(changed, "adaptive auto-mode did not switch presets");
+}
+
+#[test]
+fn camera_path_api_surface_is_stable() {
+    let presets = make_presets();
+    let mut engine = PresetEngine::new(presets, 0, false, SwitchMode::Manual, 4, 8.0);
+
+    assert_eq!(engine.camera_path_mode(), CameraPathMode::Auto);
+    assert_eq!(engine.camera_path_mode_name(), "Auto");
+    assert!((engine.camera_path_speed() - 1.0).abs() < 1e-6);
+
+    let expected = [
+        (CameraPathMode::Orbit, "Orbit"),
+        (CameraPathMode::Dolly, "Dolly"),
+        (CameraPathMode::Helix, "Helix"),
+        (CameraPathMode::Spiral, "Spiral"),
+        (CameraPathMode::Drift, "Drift"),
+        (CameraPathMode::Auto, "Auto"),
+    ];
+    for (mode, label) in expected {
+        engine.cycle_camera_path_mode();
+        assert_eq!(engine.camera_path_mode(), mode);
+        assert_eq!(engine.camera_path_mode_name(), label);
+    }
+
+    engine.step_camera_path_mode(false);
+    assert_eq!(engine.camera_path_mode(), CameraPathMode::Drift);
+    engine.step_camera_path_mode(true);
+    assert_eq!(engine.camera_path_mode(), CameraPathMode::Auto);
+
+    engine.step_camera_path_speed(99.0);
+    assert!((engine.camera_path_speed() - 4.0).abs() < 1e-6);
+    engine.step_camera_path_speed(-99.0);
+    assert!((engine.camera_path_speed() - 0.15).abs() < 1e-6);
+    engine.step_camera_path_speed(0.35);
+    assert!((engine.camera_path_speed() - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn transition_manual_smoke_avoids_immediate_kind_repetition() {
+    let presets = make_presets();
+    let mut engine = PresetEngine::new(presets, 0, false, SwitchMode::Manual, 4, 8.0);
+
+    let mut prev = engine.transition_kind_name().to_string();
+    for _ in 0..48 {
+        engine.next_preset();
+        let next = engine.transition_kind_name().to_string();
+        assert_ne!(
+            next, prev,
+            "manual transition kind repeated immediately: {}",
+            next
+        );
+        prev = next;
+    }
+}
+
+#[test]
+fn deep_zoom_fractal_motion_has_no_large_reset_spikes() {
+    let mut presets = make_presets();
+    let idx = presets
+        .iter()
+        .position(|p| p.name() == "Mandelbrot: Infinite Dive")
+        .expect("missing Mandelbrot: Infinite Dive preset");
+    let p = &mut presets[idx];
+
+    let w = 96usize;
+    let h = 64usize;
+    let n = w * h * 4;
+
+    let mut prev = vec![0u8; n];
+    let mut out = vec![0u8; n];
+    let mut first_frame = vec![0u8; n];
+    let mut captured_first = false;
+    let mut diffs = Vec::with_capacity(600);
+
+    for f in 0..600usize {
+        let t = f as f32 * (1.0 / 60.0);
+        let audio = AudioFeatures {
+            rms: 0.28,
+            bands: [0.33, 0.35, 0.31, 0.29, 0.27, 0.24, 0.22, 0.20],
+            onset: 0.0,
+            beat: false,
+            beat_strength: 0.0,
+            centroid: 0.32,
+            flatness: 0.14,
+        };
+        let ctx = RenderCtx {
+            now: Instant::now(),
+            t,
+            dt: 1.0 / 60.0,
+            w,
+            h,
+            audio,
+            beat_pulse: 0.0,
+            fractal_zoom_mul: 1.8,
+            safe: false,
+            quality: Quality::Balanced,
+            scale: 1,
+        };
+
+        p.render(&ctx, &prev, &mut out);
+        assert_eq!(out.len(), n);
+        if !captured_first {
+            first_frame.copy_from_slice(&out);
+            captured_first = true;
+        } else {
+            diffs.push(mean_abs_rgb_diff(&prev, &out));
+        }
+        std::mem::swap(&mut prev, &mut out);
+    }
+
+    assert!(!diffs.is_empty(), "no frame diffs computed");
+    let mut sorted = diffs.clone();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let max = diffs
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let first_to_last = mean_abs_rgb_diff(&first_frame, &prev);
+
+    assert!(
+        max <= median * 8.0 + 6.0,
+        "detected possible zoom reset spike: median={median:.3} max={max:.3}"
+    );
+    assert!(
+        first_to_last > (median * 0.5).max(1.0),
+        "deep zoom progression too static or looped: first_to_last={first_to_last:.3} median={median:.3}"
+    );
 }

@@ -2,13 +2,15 @@
 
 ## Runtime pipeline
 
-1. Capture audio (`mic` or `system`)
-2. Extract audio features (RMS, bands, onset, beat, beat strength)
-3. Apply intensity scaling
-4. Update preset auto-switch and transition state
-5. Render pixels with selected visual engine (`cpu` or `metal`)
-6. Draw frame with selected terminal renderer (`half-block`, `braille`, `kitty`)
-7. Update HUD and latency telemetry
+1. Startup capability probe chooses compatible engine/renderer pair (with fallback)
+2. Capture audio (`mic` or `system`)
+3. Extract audio features (RMS, bands, onset, beat, beat strength)
+4. Apply latency phase correction (manual offset + optional auto calibration)
+5. Apply optional control-matrix mappings to runtime controls
+6. Update preset auto-switch and transition state
+7. Render pixels with selected visual engine (`cpu` or `metal`)
+8. Draw frame with selected terminal renderer (`half-block`, `braille`, `kitty`)
+9. Update HUD and latency telemetry
 
 ## Major modules
 
@@ -28,7 +30,15 @@
   - main loop
   - key handling
   - playlist manager
+  - capability fallback wiring
+  - latency calibration + typography layer
+  - control-matrix/theme/graph integration
   - latency/FPS tracking
+- src/capability.rs
+  - startup compatibility probing
+  - fallback status reporting for HUD/help
+- src/prefs.rs
+  - persisted runtime preferences (`stage_mode`)
 
 ## Engine layer
 
@@ -95,3 +105,10 @@ HUD includes:
 - engine/render/total frame ms
 
 These metrics are intended for quick iteration while tuning performance and reactivity.
+
+Additional HUD/control surface fields:
+- capability probe status (and fallback reason)
+- latency calibration status (`manual/auto/effective` offset)
+- camera path mode/speed
+- typography mode and reactive text sample
+- loaded theme/graph labels and startup warning summary

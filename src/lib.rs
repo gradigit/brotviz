@@ -1,6 +1,13 @@
 pub mod app;
 pub mod audio;
+pub mod capability;
 pub mod config;
+pub mod control_matrix;
+pub mod lyrics;
+pub mod preset_graph;
+pub mod prefs;
 pub mod render;
+pub mod system_data;
 pub mod terminal;
+pub mod theme_pack;
 pub mod visual;

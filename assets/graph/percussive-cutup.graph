@@ -1,0 +1,24 @@
+# Brotviz preset graph: punchier percussive path with datamosh branching.
+# Entry is the first node listed.
+
+node kick_voronoi 6
+node sub_metaballs 7
+node hihat_sparks 8
+node snare_rings 16
+node datamosh 38
+node hyperdrive 32
+node neon_lava 33
+node lattice_drive 58
+node cyclone 57
+node final_burst 2
+
+edge kick_voronoi sub_metaballs on_beat
+edge sub_metaballs hihat_sparks beat_ge 0.52
+edge hihat_sparks snare_rings on_beat
+edge snare_rings datamosh chance 0.60
+edge snare_rings hyperdrive chance 0.40
+edge datamosh neon_lava rms_ge 0.55
+edge hyperdrive neon_lava beat_ge 0.55
+edge neon_lava lattice_drive on_beat
+edge lattice_drive cyclone rms_ge 0.62
+edge cyclone final_burst on_beat

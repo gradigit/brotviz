@@ -31,6 +31,10 @@ struct MatchReport {
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1).collect())
+}
+
+fn parse_args_from(argv: Vec<String>) -> Args {
     let mut args = Args {
         wav: PathBuf::from("assets/test/latency_pulse_120bpm.wav"),
         pulse_start_s: 2.0,
@@ -41,7 +45,6 @@ fn parse_args() -> Args {
         fail_over_ms: None,
     };
 
-    let argv = std::env::args().skip(1).collect::<Vec<_>>();
     let mut i = 0usize;
     while i < argv.len() {
         let k = argv[i].as_str();
@@ -420,5 +423,83 @@ fn read_wav_mono_f32(path: &PathBuf) -> Result<(u32, Vec<f32>)> {
             fmt_audio_format,
             fmt_bits
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_defaults_are_stable() {
+        let args = parse_args_from(Vec::new());
+        assert_eq!(
+            args.wav,
+            PathBuf::from("assets/test/latency_pulse_120bpm.wav")
+        );
+        assert!((args.pulse_start_s - 2.0).abs() < 1e-6);
+        assert!((args.pulse_interval_s - 0.5).abs() < 1e-6);
+        assert_eq!(args.pulse_count, 20);
+        assert!((args.early_ms - 80.0).abs() < 1e-6);
+        assert!((args.late_ms - 350.0).abs() < 1e-6);
+        assert_eq!(args.fail_over_ms, None);
+    }
+
+    #[test]
+    fn parse_args_clamps_ranges() {
+        let args = parse_args_from(
+            [
+                "--pulse-start-s",
+                "-5",
+                "--pulse-interval-s",
+                "0",
+                "--pulse-count",
+                "0",
+                "--early-ms",
+                "-1",
+                "--late-ms",
+                "0",
+                "--fail-over-ms",
+                "0",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        );
+
+        assert!((args.pulse_start_s - 0.0).abs() < 1e-6);
+        assert!((args.pulse_interval_s - 0.01).abs() < 1e-6);
+        assert_eq!(args.pulse_count, 1);
+        assert!((args.early_ms - 0.0).abs() < 1e-6);
+        assert!((args.late_ms - 1.0).abs() < 1e-6);
+        assert_eq!(args.fail_over_ms, Some(0.1));
+    }
+
+    #[test]
+    fn percentile_clamps_inputs_and_uses_stable_rounding() {
+        let sorted = [-10.0f32, 0.0, 5.0, 20.0];
+        assert!((percentile(&sorted, -1.0) - (-10.0)).abs() < 1e-6);
+        assert!((percentile(&sorted, 0.5) - 5.0).abs() < 1e-6);
+        assert!((percentile(&sorted, 2.0) - 20.0).abs() < 1e-6);
+        assert!((percentile(&[], 0.95) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn match_pulses_counts_matches_misses_and_false_positives() {
+        let expected = [1.0f32, 2.0, 3.0];
+        let detected = [0.6f32, 1.04, 2.25, 4.0];
+        let report = match_pulses(&expected, &detected, 0.05, 0.3);
+
+        assert_eq!(report.matched, 2);
+        assert_eq!(report.misses, 1);
+        assert_eq!(report.false_positives, 2);
+        assert_eq!(report.deltas_ms.len(), 2);
+        assert!((report.deltas_ms[0] - 40.0).abs() < 1e-3);
+        assert!((report.deltas_ms[1] - 250.0).abs() < 1e-3);
+        assert!((report.mean_ms - 145.0).abs() < 1e-3);
+        assert!((report.p50_ms - 250.0).abs() < 1e-3);
+        assert!((report.p95_ms - 250.0).abs() < 1e-3);
+        assert!((report.min_ms - 40.0).abs() < 1e-3);
+        assert!((report.max_ms - 250.0).abs() < 1e-3);
     }
 }

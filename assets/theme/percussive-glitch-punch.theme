@@ -1,0 +1,9 @@
+# Brotviz theme pack: beat-forward, sharper cuts and glitch-biased fields.
+name=Percussive Glitch Punch
+tags=club,percussive,glitch,high-energy
+presets=6,7,8,14,15,16,18,19,27,28,32,33,34,36,37,38,51,53,56,57
+transition.min_beats=4
+transition.max_beats=16
+transition.crossfade_ms=420
+defaults.intensity=1.18
+defaults.zoom=1.28

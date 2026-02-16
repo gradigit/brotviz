@@ -45,8 +45,41 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub safe: bool,
 
+    #[arg(long, default_value_t = false)]
+    pub stage_mode: bool,
+
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub auto_probe: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub latency_calibration: bool,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub latency_offset_ms: f32,
+
+    #[arg(long)]
+    pub theme_pack: Option<String>,
+
+    #[arg(long)]
+    pub control_matrix: Option<String>,
+
+    #[arg(long)]
+    pub preset_graph: Option<String>,
+
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub sync_updates: bool,
+
+    #[arg(long)]
+    pub lyrics_file: Option<String>,
+
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub lyrics_loop: bool,
+
+    #[arg(long, default_value_t = 0.0)]
+    pub lyrics_offset_ms: f32,
+
+    #[arg(long, value_enum, default_value_t = SystemDataMode::Off)]
+    pub system_data: SystemDataMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -57,10 +90,14 @@ pub enum AudioSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RendererMode {
+    #[value(alias = "ansi", alias = "text")]
+    Ascii,
     #[value(name = "half-block", alias = "halfblock", alias = "half_block", alias = "hb")]
     HalfBlock,
     #[value(alias = "hires", alias = "dots")]
     Braille,
+    #[value(alias = "sext", alias = "mosaic", alias = "symbols")]
+    Sextant,
     Kitty,
 }
 
@@ -86,6 +123,13 @@ pub enum Quality {
     High,
     Balanced,
     Fast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SystemDataMode {
+    Off,
+    Subtle,
+    Creep,
 }
 
 impl Quality {
