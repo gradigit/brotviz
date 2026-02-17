@@ -17,40 +17,36 @@ After reading these files, you'll have full context to continue.
 
 ### What Was Done
 
-- Executed wrap workflow intent:
-  - synced owned docs/state (`CLAUDE.md` created, `.doc-manifest.yaml` refreshed)
-  - generated this complete handoff snapshot for a fresh agent
-- Investigated reported hotkey instability and patched `src/app.rs` input handling:
-  - transient `crossterm` poll/read errors no longer disable input immediately
-  - input disables only after repeated consecutive failures
-  - non-TTY stdin now attempts terminal-input fallback instead of immediate disable
-- Built successfully after patch (`cargo build --release`) and validated CLI startup (`--help`)
+- Reworked prior WIP commits into scoped commits from `origin/main`.
+- Preserved backup pointer before rewrite on:
+  - `backup/pre-split-main-20260217`
+- Final commit sequence on `main`:
+  1. `c2e3a20` — `feat(visual): expand metal transitions and fractal preset dynamics`
+  2. `30cacf1` — `fix(input): retry transient terminal event reader failures`
+  3. `cc5573c` — `docs: sync usage and hotkey guidance`
+  4. `e4b600f` — `chore(git): ignore local artifact outputs`
+  5. `98a65e3` — `docs(handoff): refresh wrap snapshot after scoped commit split`
+- Wrap flow completed again with updated handoff context.
 
 ### Current State
 
-Repository state before handoff commit:
-- Modified tracked files:
-  - .gitignore
-  - README.md
-  - docs/USAGE.md
-  - src/app.rs
-  - src/visual/metal.rs
-  - src/visual/presets.rs
-  - .doc-manifest.yaml
-- Created files:
-  - CLAUDE.md
-  - HANDOFF.md
-- Untracked local artifacts:
-  - .DS_Store
-  - out/
-  - promo/
+Branch:
+- `main` (ahead of `origin/main` by 5 commits)
 
-Last existing commit before wrap:
-- `787bf21` — `chore: ignore local release artifacts`
+Tracked changes at handoff time:
+- none (clean tracked tree)
+
+Untracked local artifacts:
+- `.DS_Store`
+- `out/`
+- `promo/`
+
+Most recent commit before this handoff update:
+- `98a65e3` — `docs(handoff): refresh wrap snapshot after scoped commit split`
 
 ### What's Next
 
-1. Commit the current tracked work (exclude `.DS_Store`, `out/`, and generated media unless intentionally shipping promo assets).
+1. Push the five local commits on `main` to remote.
 2. Run an interactive Ghostty smoke check focused on hotkeys:
    - global hotkeys
    - stage-mode toggles
@@ -61,6 +57,7 @@ Last existing commit before wrap:
 ### Failed Approaches
 
 - Prior behavior (before this session fix): a single terminal input-reader error permanently disabled hotkeys for the session.
+- A single parallel git-write batch caused index-lock contention; git write operations should be serialized.
 
 ### Open Questions / Blockers
 
@@ -72,6 +69,7 @@ Last existing commit before wrap:
 - This repo includes multiple binaries; use `--bin tui_visualizer` when there is ambiguity.
 - `--source system` depends on ScreenCaptureKit and terminal Screen Recording permission.
 - Stage mode affects overlay visibility and can be mistaken for input or HUD issues during manual testing.
+- Local artifact directories (`out/`, `promo/`) remain intentionally untracked here.
 
 ## Reference Files
 
