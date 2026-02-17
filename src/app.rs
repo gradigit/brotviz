@@ -14,7 +14,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::BufWriter;
+use std::io::{BufWriter, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -665,13 +665,77 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     let mut hud_flash: Option<HudFlash> = None;
     let source_label = format!("{:?}", cfg.source);
     let engine_label = format!("{:?}", capability.engine);
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let mut input_enabled = true;
+    let mut input_error_streak: u8 = 0;
+    if !stdin_is_tty {
+        push_warning(
+            &mut startup_warnings,
+            "stdin is not a TTY; attempting terminal input fallback".to_string(),
+        );
+    }
 
     loop {
         let now = Instant::now();
 
         // Drain input events (non-blocking).
-        while event::poll(Duration::from_millis(0))? {
-            match event::read()? {
+        while input_enabled {
+            let has_event = match event::poll(Duration::from_millis(0)) {
+                Ok(v) => {
+                    input_error_streak = 0;
+                    v
+                }
+                Err(err) => {
+                    input_error_streak = input_error_streak.saturating_add(1);
+                    if input_error_streak >= 4 {
+                        input_enabled = false;
+                        push_warning(
+                            &mut startup_warnings,
+                            format!(
+                                "input disabled: failed to initialize input reader repeatedly ({err})"
+                            ),
+                        );
+                    } else {
+                        push_warning(
+                            &mut startup_warnings,
+                            format!(
+                                "input warning: initialize input reader failed (will retry) ({err})"
+                            ),
+                        );
+                    }
+                    false
+                }
+            };
+            if !has_event {
+                break;
+            }
+            let ev = match event::read() {
+                Ok(ev) => {
+                    input_error_streak = 0;
+                    ev
+                }
+                Err(err) => {
+                    input_error_streak = input_error_streak.saturating_add(1);
+                    if input_error_streak >= 4 {
+                        input_enabled = false;
+                        push_warning(
+                            &mut startup_warnings,
+                            format!(
+                                "input disabled: failed reading terminal events repeatedly ({err})"
+                            ),
+                        );
+                    } else {
+                        push_warning(
+                            &mut startup_warnings,
+                            format!(
+                                "input warning: failed reading terminal events (will retry) ({err})"
+                            ),
+                        );
+                    }
+                    break;
+                }
+            };
+            match ev {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     let old_hud = show_hud;
                     let old_stage = stage_mode;
