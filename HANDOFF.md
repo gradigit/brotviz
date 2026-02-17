@@ -25,13 +25,14 @@ After reading these files, you'll have full context to continue.
   2. `30cacf1` — `fix(input): retry transient terminal event reader failures`
   3. `cc5573c` — `docs: sync usage and hotkey guidance`
   4. `e4b600f` — `chore(git): ignore local artifact outputs`
-  5. `98a65e3` — `docs(handoff): refresh wrap snapshot after scoped commit split`
+  5. `120b5fd` — `docs(handoff): finalize wrap context after scoped split`
+- Pushed `main` to `origin/main`.
 - Wrap flow completed again with updated handoff context.
 
 ### Current State
 
 Branch:
-- `main` (ahead of `origin/main` by 5 commits)
+- `main` (in sync with `origin/main`)
 
 Tracked changes at handoff time:
 - none (clean tracked tree)
@@ -42,17 +43,16 @@ Untracked local artifacts:
 - `promo/`
 
 Most recent commit before this handoff update:
-- `98a65e3` — `docs(handoff): refresh wrap snapshot after scoped commit split`
+- `120b5fd` — `docs(handoff): finalize wrap context after scoped split`
 
 ### What's Next
 
-1. Push the five local commits on `main` to remote.
-2. Run an interactive Ghostty smoke check focused on hotkeys:
+1. Run an interactive Ghostty smoke check focused on hotkeys:
    - global hotkeys
    - stage-mode toggles
    - help/playlist/selector popups
-3. If any hotkeys still fail, instrument `Event` logging in `src/app.rs` for problematic keys/modifiers and patch mapping/gating.
-4. If stable, proceed with remaining UX/promo polish and release packaging flow.
+2. If any hotkeys still fail, instrument `Event` logging in `src/app.rs` for problematic keys/modifiers and patch mapping/gating.
+3. If stable, proceed with remaining UX/promo polish and release packaging flow.
 
 ### Failed Approaches
 
