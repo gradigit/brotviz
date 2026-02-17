@@ -10,4 +10,5 @@ pub mod render;
 pub mod system_data;
 pub mod terminal;
 pub mod theme_pack;
+pub mod typography;
 pub mod visual;

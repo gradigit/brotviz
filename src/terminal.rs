@@ -13,6 +13,9 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     pub fn new() -> anyhow::Result<Self> {
         terminal::enable_raw_mode().context("enable raw mode")?;
+        // Create the guard immediately so Drop will disable raw mode if
+        // any subsequent setup step fails.
+        let guard = Self { _private: () };
 
         let mut out = stdout();
         out.execute(terminal::EnterAlternateScreen)
@@ -21,7 +24,7 @@ impl TerminalGuard {
             .context("clear screen")?;
         out.execute(cursor::Hide).context("hide cursor")?;
 
-        Ok(Self { _private: () })
+        Ok(guard)
     }
 
     pub fn stdout() -> Stdout {

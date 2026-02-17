@@ -531,6 +531,7 @@ pub struct FieldPreset {
     palette: Palette,
     fb: Feedback,
     seed: u32,
+    post_fx_scratch: Vec<u8>,
 }
 
 impl FieldPreset {
@@ -541,6 +542,7 @@ impl FieldPreset {
             palette,
             fb,
             seed: fastrand::u32(..),
+            post_fx_scratch: Vec::new(),
         }
     }
 }
@@ -796,7 +798,7 @@ impl Preset for FieldPreset {
             }
         }
 
-        apply_post_fx(out, w, h, t, route, ctx.quality);
+        apply_post_fx(out, w, h, t, route, ctx.quality, &mut self.post_fx_scratch);
     }
 }
 
@@ -1946,7 +1948,7 @@ fn nova_fractal(
     ((1.0 - n).powf(0.42) * 0.56 + root_glow * 0.30 + stripe * 0.14).clamp(0.0, 1.0)
 }
 
-fn apply_post_fx(out: &mut [u8], w: usize, h: usize, t: f32, route: RouteMap, quality: Quality) {
+fn apply_post_fx(out: &mut [u8], w: usize, h: usize, t: f32, route: RouteMap, quality: Quality, scratch: &mut Vec<u8>) {
     let frame_len = w.saturating_mul(h).saturating_mul(4);
     if out.len() < frame_len || w == 0 || h == 0 {
         return;
@@ -1983,7 +1985,9 @@ fn apply_post_fx(out: &mut [u8], w: usize, h: usize, t: f32, route: RouteMap, qu
         Quality::High | Quality::Ultra => BLOOM_HIGH,
     };
 
-    let src = out[..frame_len].to_vec();
+    scratch.resize(frame_len, 0);
+    scratch[..frame_len].copy_from_slice(&out[..frame_len]);
+    let src = &scratch[..frame_len];
     let chroma = (route.chroma * fx_mix).clamp(0.0, 4.0);
     let scan_amt = (route.scanline * fx_mix).clamp(0.0, 0.85);
     let vig_amt = (route.vignette * fx_mix).clamp(0.0, 0.92);

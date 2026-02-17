@@ -1,15 +1,12 @@
 use crate::audio::AudioFeatures;
 use crate::config::{Quality, SwitchMode};
 use crate::visual::{
-    classify_scene_section, is_fractal_preset_name, suggest_manual_transition,
-    suggest_transition_for_section, transition_base_duration, transition_duration_for_kind,
-    CameraPathMode, FractalZoomMode, RenderCtx, SceneSection, TransitionKind, TransitionMode,
-    VisualEngine,
+    CameraPathMode, FractalZoomMode, PlaybackContext, RenderCtx, TransitionMode, VisualEngine,
 };
 use anyhow::{anyhow, Context};
 use metal::*;
 use objc::rc::autoreleasepool;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const METAL_PRESET_COUNT: usize = 56;
 const MANDEL_REF_MAX: usize = 896;
@@ -74,33 +71,7 @@ struct Uniforms {
 
 pub struct MetalEngine {
     preset_names: Vec<&'static str>,
-    playlist: Vec<usize>,
-    active: usize,
-    next: Option<usize>,
-    shuffle: bool,
-    switch_mode: SwitchMode,
-    last_auto_mode: SwitchMode,
-    beats_per_switch: u32,
-    seconds_per_switch: f32,
-    last_switch: Instant,
-    beat_counter: u32,
-    transition_started: Option<Instant>,
-    transition_dur: Duration,
-    transition_kind: TransitionKind,
-    transition_seed: u32,
-    transition_mode: TransitionMode,
-    last_transition_kind: TransitionKind,
-    transition_override: Option<TransitionKind>,
-    fractal_zoom_mode: FractalZoomMode,
-    fractal_zoom_drive: f32,
-    fractal_zoom_enabled: bool,
-    fractal_bias: bool,
-    scene_section: SceneSection,
-    scene_section_pending: SceneSection,
-    scene_section_votes: u8,
-    scene_section_changed_at: Instant,
-    camera_path_mode: CameraPathMode,
-    camera_path_speed: f32,
+    ctx: PlaybackContext,
 
     device: Device,
     queue: CommandQueue,
@@ -119,8 +90,11 @@ pub struct MetalEngine {
     uniforms: Buffer,
     mandel_orbits: Buffer,
 
-    readback: Buffer,
+    readback_a: Buffer,
+    readback_b: Buffer,
     readback_bpr: usize,
+    readback_ping: bool,
+    prev_cmd: Option<CommandBuffer>,
     cpu_pixels: Vec<u8>,
     out_pixels: Vec<u8>,
     mandel_orbit_cpu: Vec<[f32; 2]>,
@@ -169,46 +143,19 @@ impl MetalEngine {
             MTLResourceOptions::StorageModeShared,
         );
 
-        let (tex_a, tex_b, readback, readback_bpr, cpu_pixels) = make_resources(&device, 1, 1)?;
-
-        let now = Instant::now();
-        let active = active.min(preset_names.len().saturating_sub(1));
-        let last_auto_mode = if switch_mode == SwitchMode::Manual {
-            SwitchMode::Adaptive
-        } else {
-            switch_mode
-        };
+        let (tex_a, tex_b, readback_a, readback_b, readback_bpr, cpu_pixels) = make_resources(&device, 1, 1)?;
 
         let preset_count = preset_names.len();
         Ok(Self {
+            ctx: PlaybackContext::new(
+                preset_count,
+                active,
+                shuffle,
+                switch_mode,
+                beats_per_switch,
+                seconds_per_switch,
+            ),
             preset_names,
-            playlist: (0..preset_count).collect(),
-            active,
-            next: None,
-            shuffle,
-            switch_mode,
-            last_auto_mode,
-            beats_per_switch: beats_per_switch.max(1),
-            seconds_per_switch: seconds_per_switch.max(1.0),
-            last_switch: now,
-            beat_counter: 0,
-            transition_started: None,
-            transition_dur: Duration::from_millis(900),
-            transition_kind: TransitionKind::Fade,
-            transition_seed: fastrand::u32(..),
-            transition_mode: TransitionMode::Auto,
-            last_transition_kind: TransitionKind::Fade,
-            transition_override: None,
-            fractal_zoom_mode: FractalZoomMode::Balanced,
-            fractal_zoom_drive: 1.0,
-            fractal_zoom_enabled: true,
-            fractal_bias: false,
-            scene_section: SceneSection::Groove,
-            scene_section_pending: SceneSection::Groove,
-            scene_section_votes: 0,
-            scene_section_changed_at: now,
-            camera_path_mode: CameraPathMode::Auto,
-            camera_path_speed: 1.0,
             device,
             queue,
             pipeline,
@@ -223,40 +170,15 @@ impl MetalEngine {
             tex_b,
             uniforms,
             mandel_orbits,
-            readback,
+            readback_a,
+            readback_b,
             readback_bpr,
+            readback_ping: false,
+            prev_cmd: None,
             cpu_pixels,
             out_pixels: Vec::new(),
             mandel_orbit_cpu: vec![[0.0; 2]; MANDEL_REF_SLOTS],
         })
-    }
-
-    fn set_playlist_indices_internal(&mut self, indices: &[usize]) {
-        if self.preset_names.is_empty() {
-            self.playlist.clear();
-            return;
-        }
-
-        let mut seen = vec![false; self.preset_names.len()];
-        let mut playlist = Vec::with_capacity(indices.len().max(1));
-        for &idx in indices {
-            if idx < self.preset_names.len() && !seen[idx] {
-                seen[idx] = true;
-                playlist.push(idx);
-            }
-        }
-        if playlist.is_empty() {
-            playlist.extend(0..self.preset_names.len());
-        }
-        self.playlist = playlist;
-
-        if !self.playlist.contains(&self.active) {
-            self.active = self.playlist[0];
-            self.next = None;
-            self.transition_started = None;
-            self.transition_kind = TransitionKind::Fade;
-            self.last_transition_kind = TransitionKind::Fade;
-        }
     }
 
     fn map_name_to_shader_preset(name: &str, fallback: usize) -> u32 {
@@ -425,167 +347,25 @@ impl MetalEngine {
         len
     }
 
-    fn playlist_pos_for_active(&self) -> usize {
-        self.playlist
-            .iter()
-            .position(|&i| i == self.active)
-            .unwrap_or(0)
-    }
-
-    fn pick_shuffle(&mut self) -> usize {
-        if self.playlist.is_empty() {
-            return self.active;
-        }
-        if self.playlist.len() == 1 {
-            return self.playlist[0];
-        }
-        let mut idx = self.playlist[fastrand::usize(..self.playlist.len())];
-        if idx == self.active {
-            let pos = self.playlist_pos_for_active();
-            idx = self.playlist[(pos + 1) % self.playlist.len()];
-        }
-        idx
-    }
-
-    fn start_transition(&mut self, next: usize) {
-        if next == self.active || self.preset_names.is_empty() {
-            return;
-        }
-        // Manual transitions keep a consistent feel.
-        self.transition_seed = fastrand::u32(..);
-        self.transition_kind = if let Some(k) = self.transition_override {
-            k
-        } else {
-            suggest_manual_transition(
-                self.transition_seed,
-                self.transition_mode,
-                self.last_transition_kind,
-            )
-        };
-        self.transition_dur = transition_base_duration(self.transition_kind);
-        self.last_transition_kind = self.transition_kind;
-        self.next = Some(next);
-        self.transition_started = Some(Instant::now());
-        self.last_switch = Instant::now();
-        self.beat_counter = 0;
-    }
-
-    fn start_transition_with_dur(&mut self, next: usize, dur: Duration, kind: TransitionKind) {
-        if next == self.active || self.preset_names.is_empty() {
-            return;
-        }
-        self.transition_dur = dur.clamp(Duration::from_millis(80), Duration::from_millis(2600));
-        self.transition_kind = kind;
-        self.last_transition_kind = kind;
-        self.transition_seed = fastrand::u32(..);
-        self.next = Some(next);
-        self.transition_started = Some(Instant::now());
-        self.last_switch = Instant::now();
-        self.beat_counter = 0;
-    }
-
-    fn next_preset_auto(&mut self, audio: &AudioFeatures) {
-        if self.playlist.is_empty() {
-            return;
-        }
-        let mut next = if self.shuffle {
-            self.pick_shuffle()
-        } else {
-            let pos = self.playlist_pos_for_active();
-            self.playlist[(pos + 1) % self.playlist.len()]
-        };
-        if self.fractal_bias
-            && self.switch_mode == SwitchMode::Adaptive
-            && self.scene_section == SceneSection::Calm
-            && fastrand::f32() < 0.78
-        {
-            if let Some(fr) = self.pick_fractal_index() {
-                next = fr;
-            }
-        }
-        let (mut dur, mut kind) = suggest_transition_for_section(
-            audio,
-            fastrand::u32(..),
-            self.transition_mode,
-            self.last_transition_kind,
-            self.scene_section,
-        );
-        if let Some(k) = self.transition_override {
-            kind = k;
-            dur = transition_duration_for_kind(kind, audio);
-        }
-        self.start_transition_with_dur(next, dur, kind);
-    }
-
-    fn update_scene_section_state(&mut self, now: Instant, audio: &AudioFeatures) {
-        let candidate = classify_scene_section(audio);
-        if candidate == self.scene_section {
-            self.scene_section_pending = candidate;
-            self.scene_section_votes = 0;
-            return;
-        }
-        if candidate != self.scene_section_pending {
-            self.scene_section_pending = candidate;
-            self.scene_section_votes = 1;
-            return;
-        }
-        self.scene_section_votes = self.scene_section_votes.saturating_add(1);
-        let min_votes = metal_section_hysteresis_votes(self.scene_section, candidate);
-        let min_hold = metal_section_hysteresis_hold(self.scene_section, candidate);
-        if self.scene_section_votes >= min_votes
-            && now.duration_since(self.scene_section_changed_at) >= min_hold
-        {
-            self.scene_section = candidate;
-            self.scene_section_pending = candidate;
-            self.scene_section_votes = 0;
-            self.scene_section_changed_at = now;
-        }
-    }
-
-    fn pick_fractal_index(&mut self) -> Option<usize> {
-        if self.playlist.len() <= 1 {
-            return None;
-        }
-        let fractals = self
-            .playlist
-            .iter()
-            .copied()
-            .filter_map(|i| {
-                if i != self.active && is_fractal_preset_name(self.preset_names[i]) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        if fractals.is_empty() {
-            return None;
-        }
-        if self.shuffle {
-            return Some(fractals[fastrand::usize(..fractals.len())]);
-        }
-        let pos = self.playlist_pos_for_active();
-        for d in 1..self.playlist.len() {
-            let idx = self.playlist[(pos + d) % self.playlist.len()];
-            if idx != self.active && is_fractal_preset_name(self.preset_names[idx]) {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
     fn ensure_size(&mut self, w: usize, h: usize) -> anyhow::Result<()> {
         let w = w.max(1);
         let h = h.max(1);
         if w == self.w && h == self.h {
             return Ok(());
         }
-        let (tex_a, tex_b, readback, readback_bpr, cpu_pixels) = make_resources(&self.device, w, h)
-            .with_context(|| format!("allocate Metal render targets ({w}x{h})"))?;
+        // Wait for any in-flight GPU work before reallocating resources.
+        if let Some(cmd) = self.prev_cmd.take() {
+            cmd.wait_until_completed();
+        }
+        let (tex_a, tex_b, readback_a, readback_b, readback_bpr, cpu_pixels) =
+            make_resources(&self.device, w, h)
+                .with_context(|| format!("allocate Metal render targets ({w}x{h})"))?;
         self.tex_a = tex_a;
         self.tex_b = tex_b;
-        self.readback = readback;
+        self.readback_a = readback_a;
+        self.readback_b = readback_b;
         self.readback_bpr = readback_bpr;
+        self.readback_ping = false;
         self.cpu_pixels = cpu_pixels;
         self.w = w;
         self.h = h;
@@ -606,278 +386,54 @@ impl MetalEngine {
 
 impl VisualEngine for MetalEngine {
     fn resize(&mut self, w: usize, h: usize) {
-        // Resize is fallible for Metal (resource allocation); keep trait simple and make
-        // failures surface during render.
         let _ = self.ensure_size(w, h);
     }
 
     fn preset_name(&self) -> &'static str {
         self.preset_names
-            .get(self.active)
+            .get(self.ctx.active)
             .copied()
             .unwrap_or("<none>")
     }
 
     fn set_playlist_indices(&mut self, indices: &[usize]) {
-        self.set_playlist_indices_internal(indices);
+        self.ctx.set_playlist_indices(indices)
     }
 
-    fn set_shuffle(&mut self, on: bool) {
-        self.shuffle = on;
-    }
-
-    fn toggle_shuffle(&mut self) {
-        self.shuffle = !self.shuffle;
-    }
-
-    fn cycle_transition_mode(&mut self) {
-        self.transition_mode = self.transition_mode.next();
-    }
-
-    fn transition_mode(&self) -> TransitionMode {
-        self.transition_mode
-    }
-
-    fn transition_kind_name(&self) -> &'static str {
-        self.transition_kind.label()
-    }
-
-    fn transition_selection_name(&self) -> &'static str {
-        if let Some(k) = self.transition_override {
-            k.label()
-        } else {
-            "Auto"
-        }
-    }
-
-    fn transition_selection_locked(&self) -> bool {
-        self.transition_override.is_some()
-    }
-
-    fn scene_section_name(&self) -> &'static str {
-        self.scene_section.label()
-    }
-
-    fn next_transition_kind(&mut self) {
-        self.transition_override = match self.transition_override {
-            None => Some(TransitionKind::all()[0]),
-            Some(k) => {
-                let n = k.next();
-                if n == TransitionKind::all()[0] {
-                    None
-                } else {
-                    Some(n)
-                }
-            }
-        };
-    }
-
-    fn prev_transition_kind(&mut self) {
-        self.transition_override = match self.transition_override {
-            None => {
-                let all = TransitionKind::all();
-                Some(all[all.len() - 1])
-            }
-            Some(k) => {
-                if k == TransitionKind::all()[0] {
-                    None
-                } else {
-                    Some(k.prev())
-                }
-            }
-        };
-    }
-
-    fn toggle_fractal_bias(&mut self) {
-        self.fractal_bias = !self.fractal_bias;
-    }
-
-    fn fractal_bias(&self) -> bool {
-        self.fractal_bias
-    }
-
-    fn cycle_camera_path_mode(&mut self) {
-        self.camera_path_mode = self.camera_path_mode.next();
-    }
-
-    fn step_camera_path_mode(&mut self, forward: bool) {
-        self.camera_path_mode = self.camera_path_mode.step(forward);
-    }
-
-    fn camera_path_mode(&self) -> CameraPathMode {
-        self.camera_path_mode
-    }
-
-    fn camera_path_mode_name(&self) -> &'static str {
-        self.camera_path_mode.label()
-    }
-
-    fn step_camera_path_speed(&mut self, delta: f32) {
-        self.camera_path_speed = (self.camera_path_speed + delta).clamp(0.15, 4.0);
-    }
-
-    fn camera_path_speed(&self) -> f32 {
-        self.camera_path_speed
-    }
-
-    fn cycle_fractal_zoom_mode(&mut self) {
-        self.fractal_zoom_mode = self.fractal_zoom_mode.next();
-    }
-
-    fn fractal_zoom_mode(&self) -> FractalZoomMode {
-        self.fractal_zoom_mode
-    }
-
-    fn set_fractal_zoom_drive(&mut self, v: f32) {
-        self.fractal_zoom_drive = v.clamp(0.12, 8.0);
-    }
-
-    fn fractal_zoom_drive(&self) -> f32 {
-        self.fractal_zoom_drive
-    }
-
-    fn toggle_fractal_zoom_enabled(&mut self) {
-        self.fractal_zoom_enabled = !self.fractal_zoom_enabled;
-    }
-
-    fn fractal_zoom_enabled(&self) -> bool {
-        self.fractal_zoom_enabled
-    }
-
-    fn toggle_auto_switch(&mut self) {
-        if self.switch_mode == SwitchMode::Manual {
-            let m = if self.last_auto_mode == SwitchMode::Manual {
-                SwitchMode::Adaptive
-            } else {
-                self.last_auto_mode
-            };
-            self.switch_mode = m;
-        } else {
-            self.last_auto_mode = self.switch_mode;
-            self.switch_mode = SwitchMode::Manual;
-        }
-    }
-
-    fn set_switch_mode(&mut self, m: SwitchMode) {
-        self.switch_mode = m;
-        if m != SwitchMode::Manual {
-            self.last_auto_mode = m;
-        }
-    }
-
-    fn switch_mode(&self) -> SwitchMode {
-        self.switch_mode
-    }
-
-    fn shuffle(&self) -> bool {
-        self.shuffle
-    }
-
-    fn auto_switch(&self) -> bool {
-        self.switch_mode != SwitchMode::Manual
-    }
-
-    fn prev_preset(&mut self) {
-        if self.playlist.is_empty() {
-            return;
-        }
-        let pos = self.playlist_pos_for_active();
-        let next = if pos == 0 {
-            self.playlist[self.playlist.len() - 1]
-        } else {
-            self.playlist[pos - 1]
-        };
-        self.start_transition(next);
-    }
-
-    fn next_preset(&mut self) {
-        if self.playlist.is_empty() {
-            return;
-        }
-        let next = if self.shuffle {
-            self.pick_shuffle()
-        } else {
-            let pos = self.playlist_pos_for_active();
-            self.playlist[(pos + 1) % self.playlist.len()]
-        };
-        self.start_transition(next);
-    }
+    fn set_shuffle(&mut self, on: bool) { self.ctx.set_shuffle(on) }
+    fn toggle_shuffle(&mut self) { self.ctx.toggle_shuffle() }
+    fn cycle_transition_mode(&mut self) { self.ctx.cycle_transition_mode() }
+    fn transition_mode(&self) -> TransitionMode { self.ctx.transition_mode() }
+    fn transition_kind_name(&self) -> &'static str { self.ctx.transition_kind_name() }
+    fn transition_selection_name(&self) -> &'static str { self.ctx.transition_selection_name() }
+    fn transition_selection_locked(&self) -> bool { self.ctx.transition_selection_locked() }
+    fn next_transition_kind(&mut self) { self.ctx.next_transition_kind() }
+    fn prev_transition_kind(&mut self) { self.ctx.prev_transition_kind() }
+    fn scene_section_name(&self) -> &'static str { self.ctx.scene_section_name() }
+    fn cycle_camera_path_mode(&mut self) { self.ctx.cycle_camera_path_mode() }
+    fn step_camera_path_mode(&mut self, forward: bool) { self.ctx.step_camera_path_mode(forward) }
+    fn camera_path_mode(&self) -> CameraPathMode { self.ctx.camera_path_mode() }
+    fn step_camera_path_speed(&mut self, delta: f32) { self.ctx.step_camera_path_speed(delta) }
+    fn camera_path_speed(&self) -> f32 { self.ctx.camera_path_speed() }
+    fn toggle_fractal_bias(&mut self) { self.ctx.toggle_fractal_bias() }
+    fn fractal_bias(&self) -> bool { self.ctx.fractal_bias() }
+    fn cycle_fractal_zoom_mode(&mut self) { self.ctx.cycle_fractal_zoom_mode() }
+    fn fractal_zoom_mode(&self) -> FractalZoomMode { self.ctx.fractal_zoom_mode() }
+    fn set_fractal_zoom_drive(&mut self, v: f32) { self.ctx.set_fractal_zoom_drive(v) }
+    fn fractal_zoom_drive(&self) -> f32 { self.ctx.fractal_zoom_drive() }
+    fn toggle_fractal_zoom_enabled(&mut self) { self.ctx.toggle_fractal_zoom_enabled() }
+    fn fractal_zoom_enabled(&self) -> bool { self.ctx.fractal_zoom_enabled() }
+    fn toggle_auto_switch(&mut self) { self.ctx.toggle_auto_switch() }
+    fn set_switch_mode(&mut self, m: SwitchMode) { self.ctx.set_switch_mode(m) }
+    fn switch_mode(&self) -> SwitchMode { self.ctx.switch_mode() }
+    fn shuffle(&self) -> bool { self.ctx.shuffle() }
+    fn auto_switch(&self) -> bool { self.ctx.auto_switch() }
+    fn prev_preset(&mut self) { self.ctx.prev_preset() }
+    fn next_preset(&mut self) { self.ctx.next_preset() }
 
     fn update_auto_switch(&mut self, now: Instant, audio: &AudioFeatures) {
-        self.update_scene_section_state(now, audio);
-
-        if self.switch_mode == SwitchMode::Manual {
-            return;
-        }
-        if self.transition_started.is_some() {
-            return;
-        }
-
-        match self.switch_mode {
-            SwitchMode::Manual => {}
-            SwitchMode::Beat => {
-                if audio.beat {
-                    self.beat_counter = self.beat_counter.wrapping_add(1);
-                    let beats_per =
-                        metal_section_beats_per_switch(self.beats_per_switch, self.scene_section);
-                    if self.beat_counter % beats_per == 0 {
-                        self.next_preset_auto(audio);
-                    }
-                }
-            }
-            SwitchMode::Energy => {
-                let e = audio.rms;
-                let since = now.duration_since(self.last_switch).as_secs_f32();
-                let (energy_gate, min_since) = metal_section_energy_gate(self.scene_section);
-                if e > energy_gate && since > min_since {
-                    self.next_preset_auto(audio);
-                }
-            }
-            SwitchMode::Time => {
-                let target =
-                    (self.seconds_per_switch * metal_section_time_scale(self.scene_section))
-                        .clamp(2.0, 60.0);
-                if now.duration_since(self.last_switch).as_secs_f32() > target {
-                    self.next_preset_auto(audio);
-                }
-            }
-            SwitchMode::Adaptive => {
-                let since = now.duration_since(self.last_switch).as_secs_f32();
-                let treb = (audio.bands[5] + audio.bands[6] + audio.bands[7]) * (1.0 / 3.0);
-                let hit = audio.onset.max(audio.beat_strength).max(treb);
-                let e = audio.rms;
-
-                let pace_scale = metal_section_time_scale(self.scene_section);
-                let mut target =
-                    self.seconds_per_switch * pace_scale * (1.25 - 0.7 * e) * (1.10 - 0.55 * hit);
-                target = match self.scene_section {
-                    SceneSection::Calm => target.clamp(5.5, 32.0),
-                    SceneSection::Groove => target.clamp(4.0, 28.0),
-                    SceneSection::Drive => target.clamp(3.2, 22.0),
-                    SceneSection::Impact => target.clamp(2.2, 15.0),
-                };
-
-                let min_since = match self.scene_section {
-                    SceneSection::Calm => 3.4,
-                    SceneSection::Groove => 2.8,
-                    SceneSection::Drive => 2.2,
-                    SceneSection::Impact => 1.6,
-                };
-                let slam_gate = match self.scene_section {
-                    SceneSection::Calm => 0.88,
-                    SceneSection::Groove => 0.84,
-                    SceneSection::Drive => 0.80,
-                    SceneSection::Impact => 0.74,
-                };
-                let slam =
-                    (audio.beat && audio.beat_strength > slam_gate) || audio.onset > (slam_gate - 0.04);
-                if slam && since > min_since {
-                    self.next_preset_auto(audio);
-                } else if since > target {
-                    self.next_preset_auto(audio);
-                }
-            }
-        }
+        let names = &self.preset_names;
+        self.ctx.update_auto_switch(now, audio, |i| names[i])
     }
 
     fn render(&mut self, ctx: RenderCtx, quality: Quality, scale: usize) -> &[u8] {
@@ -892,28 +448,15 @@ impl VisualEngine for MetalEngine {
             return &self.cpu_pixels;
         }
 
-        let alpha = if let (Some(start), Some(next)) = (self.transition_started, self.next) {
-            let t = ctx.now.duration_since(start).as_secs_f32() / self.transition_dur.as_secs_f32();
-            if t >= 1.0 {
-                self.active = next;
-                self.next = None;
-                self.transition_started = None;
-                self.transition_kind = TransitionKind::Fade;
-                0.0
-            } else {
-                t.clamp(0.0, 1.0)
-            }
-        } else {
-            0.0
-        };
+        let alpha = self.ctx.step_transition(ctx.now);
 
-        let active = self.shader_preset_index(self.active);
-        let next = self.shader_preset_index(self.next.unwrap_or(self.active));
+        let active = self.shader_preset_index(self.ctx.active);
+        let next = self.shader_preset_index(self.ctx.next.unwrap_or(self.ctx.active));
 
         let seed = if alpha == 0.0 {
             fastrand::u32(..)
         } else {
-            self.transition_seed
+            self.ctx.transition_seed
         };
         let quality_u32 = Self::quality_u32(quality);
         let bass = ctx.audio.bands[1].clamp(0.0, 1.0);
@@ -924,11 +467,7 @@ impl VisualEngine for MetalEngine {
             .clamp(0.0, 1.0);
         let treb = ctx.audio.bands[5].clamp(0.0, 1.0);
         let beat = ctx.beat_pulse.clamp(0.0, 1.0);
-        let zoom_mul = if self.fractal_zoom_enabled {
-            self.fractal_zoom_mode.multiplier() * self.fractal_zoom_drive
-        } else {
-            -1.0
-        };
+        let zoom_mul = self.ctx.fractal_zoom_mul();
 
         let active_params = Self::build_mandel_ref_params(
             active,
@@ -967,7 +506,7 @@ impl VisualEngine for MetalEngine {
             h: self.h as u32,
             active_preset: active,
             next_preset: next,
-            transition_kind: self.transition_kind as u32,
+            transition_kind: self.ctx.transition_kind as u32,
             time: ctx.t,
             dt: ctx.dt,
             transition_alpha: alpha,
@@ -982,8 +521,8 @@ impl VisualEngine for MetalEngine {
             safe: if ctx.safe { 1 } else { 0 },
             quality: quality_u32,
             has_prev: if self.has_prev { 1 } else { 0 },
-            camera_path_mode: self.camera_path_mode as u32,
-            camera_path_speed: self.camera_path_speed,
+            camera_path_mode: self.ctx.camera_path_mode as u32,
+            camera_path_speed: self.ctx.camera_path_speed,
             active_ref_offset,
             active_ref_len,
             active_ref_enabled: if active_params.enabled && active_ref_len > 64 { 1 } else { 0 },
@@ -1009,13 +548,53 @@ impl VisualEngine for MetalEngine {
             );
         }
 
+        let row_bytes = self.w.saturating_mul(4);
+
+        // Wait for the *previous* frame's GPU work and read back its results.
+        // This overlaps the CPU work of the current frame with the previous
+        // frame's GPU compute, reducing total frame latency.
+        let have_prev_result = if let Some(cmd) = self.prev_cmd.take() {
+            cmd.wait_until_completed();
+            true
+        } else {
+            false
+        };
+
+        if have_prev_result && row_bytes > 0 {
+            let prev_rb = if self.readback_ping {
+                &self.readback_a
+            } else {
+                &self.readback_b
+            };
+            unsafe {
+                let src = std::slice::from_raw_parts(
+                    prev_rb.contents().cast::<u8>(),
+                    self.readback_bpr.saturating_mul(self.h),
+                );
+                for y in 0..self.h {
+                    let src_off = y * self.readback_bpr;
+                    let dst_off = y * row_bytes;
+                    let src_row = &src[src_off..src_off + row_bytes];
+                    let dst_row = &mut self.cpu_pixels[dst_off..dst_off + row_bytes];
+                    dst_row.copy_from_slice(src_row);
+                }
+            }
+        }
+
         let (prev, out) = if self.ping {
             (&self.tex_a, &self.tex_b)
         } else {
             (&self.tex_b, &self.tex_a)
         };
 
-        autoreleasepool(|| {
+        // Current readback buffer (alternates each frame).
+        let cur_rb = if self.readback_ping {
+            &self.readback_b
+        } else {
+            &self.readback_a
+        };
+
+        let new_cmd = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
 
             let encoder = cmd.new_compute_command_encoder();
@@ -1038,7 +617,7 @@ impl VisualEngine for MetalEngine {
                 0,
                 MTLOrigin { x: 0, y: 0, z: 0 },
                 MTLSize::new(self.w as u64, self.h as u64, 1),
-                &self.readback,
+                cur_rb,
                 0,
                 self.readback_bpr as u64,
                 (self.readback_bpr.saturating_mul(self.h)) as u64,
@@ -1046,27 +625,32 @@ impl VisualEngine for MetalEngine {
             );
             blit.end_encoding();
 
-            cmd.commit();
-            cmd.wait_until_completed();
+            // Retain the command buffer so it survives the autoreleasepool.
+            let owned = cmd.to_owned();
+            owned.commit();
+            owned
         });
 
-        let row_bytes = self.w.saturating_mul(4);
-        if row_bytes == 0 {
-            return &self.cpu_pixels;
-        }
-
-        unsafe {
-            let src = std::slice::from_raw_parts(
-                self.readback.contents().cast::<u8>(),
-                self.readback_bpr.saturating_mul(self.h),
-            );
-            for y in 0..self.h {
-                let src_off = y * self.readback_bpr;
-                let dst_off = y * row_bytes;
-                let src_row = &src[src_off..src_off + row_bytes];
-                let dst_row = &mut self.cpu_pixels[dst_off..dst_off + row_bytes];
-                dst_row.copy_from_slice(src_row);
+        // First frame: no previous result yet, fall back to synchronous wait.
+        if !have_prev_result && row_bytes > 0 {
+            new_cmd.wait_until_completed();
+            unsafe {
+                let src = std::slice::from_raw_parts(
+                    cur_rb.contents().cast::<u8>(),
+                    self.readback_bpr.saturating_mul(self.h),
+                );
+                for y in 0..self.h {
+                    let src_off = y * self.readback_bpr;
+                    let dst_off = y * row_bytes;
+                    let src_row = &src[src_off..src_off + row_bytes];
+                    let dst_row = &mut self.cpu_pixels[dst_off..dst_off + row_bytes];
+                    dst_row.copy_from_slice(src_row);
+                }
             }
+            self.readback_ping = !self.readback_ping;
+        } else {
+            self.prev_cmd = Some(new_cmd);
+            self.readback_ping = !self.readback_ping;
         }
 
         self.has_prev = true;
@@ -1109,74 +693,11 @@ impl VisualEngine for MetalEngine {
     }
 }
 
-fn metal_section_hysteresis_votes(from: SceneSection, to: SceneSection) -> u8 {
-    let from_rank = metal_section_intensity_rank(from);
-    let to_rank = metal_section_intensity_rank(to);
-    let delta = to_rank - from_rank;
-    if delta >= 2 {
-        2
-    } else if delta > 0 {
-        3
-    } else if delta < 0 {
-        4
-    } else {
-        1
-    }
-}
-
-fn metal_section_hysteresis_hold(from: SceneSection, to: SceneSection) -> Duration {
-    match (from, to) {
-        (SceneSection::Calm, SceneSection::Groove)
-        | (SceneSection::Groove, SceneSection::Drive)
-        | (SceneSection::Drive, SceneSection::Impact) => Duration::from_millis(650),
-        (SceneSection::Impact, SceneSection::Drive)
-        | (SceneSection::Drive, SceneSection::Groove)
-        | (SceneSection::Groove, SceneSection::Calm) => Duration::from_millis(1650),
-        _ => Duration::from_millis(1000),
-    }
-}
-
-fn metal_section_time_scale(section: SceneSection) -> f32 {
-    match section {
-        SceneSection::Calm => 1.35,
-        SceneSection::Groove => 1.0,
-        SceneSection::Drive => 0.78,
-        SceneSection::Impact => 0.58,
-    }
-}
-
-fn metal_section_beats_per_switch(base: u32, section: SceneSection) -> u32 {
-    match section {
-        SceneSection::Calm => base.saturating_add(2).max(1),
-        SceneSection::Groove => base.saturating_add(1).max(1),
-        SceneSection::Drive => base.max(1),
-        SceneSection::Impact => base.saturating_sub(1).max(1),
-    }
-}
-
-fn metal_section_energy_gate(section: SceneSection) -> (f32, f32) {
-    match section {
-        SceneSection::Calm => (0.28, 12.0),
-        SceneSection::Groove => (0.34, 8.8),
-        SceneSection::Drive => (0.40, 6.2),
-        SceneSection::Impact => (0.46, 4.6),
-    }
-}
-
-const fn metal_section_intensity_rank(section: SceneSection) -> i8 {
-    match section {
-        SceneSection::Calm => 0,
-        SceneSection::Groove => 1,
-        SceneSection::Drive => 2,
-        SceneSection::Impact => 3,
-    }
-}
-
 fn make_resources(
     device: &Device,
     w: usize,
     h: usize,
-) -> anyhow::Result<(Texture, Texture, Buffer, usize, Vec<u8>)> {
+) -> anyhow::Result<(Texture, Texture, Buffer, Buffer, usize, Vec<u8>)> {
     let w = w.max(1);
     let h = h.max(1);
 
@@ -1195,10 +716,11 @@ fn make_resources(
     let row_bytes = w.saturating_mul(4);
     let readback_bpr = ((row_bytes + align - 1) / align) * align;
     let readback_len = readback_bpr.saturating_mul(h);
-    let readback = device.new_buffer(readback_len as u64, MTLResourceOptions::StorageModeShared);
+    let readback_a = device.new_buffer(readback_len as u64, MTLResourceOptions::StorageModeShared);
+    let readback_b = device.new_buffer(readback_len as u64, MTLResourceOptions::StorageModeShared);
 
     let cpu_pixels = vec![0u8; row_bytes.saturating_mul(h)];
-    Ok((tex_a, tex_b, readback, readback_bpr, cpu_pixels))
+    Ok((tex_a, tex_b, readback_a, readback_b, readback_bpr, cpu_pixels))
 }
 
 const METAL_SRC: &str = r#"

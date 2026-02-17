@@ -4,8 +4,9 @@ use base64::Engine;
 use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap, shm_open, shm_unlink};
 use nix::sys::stat::Mode;
 use nix::unistd::ftruncate;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
@@ -148,7 +149,13 @@ impl KittyRenderer {
                 &mut self.b64_buf,
             ),
             KittyTransport::File => {
-                fs::write(self.temp_path.as_str(), frame.pixels_rgba)
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(self.temp_path.as_str())
+                    .and_then(|mut f| f.write_all(frame.pixels_rgba))
                     .with_context(|| format!("write kitty temp file {}", self.temp_path))?;
 
                 write!(

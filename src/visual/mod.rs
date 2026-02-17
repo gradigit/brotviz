@@ -808,48 +808,40 @@ pub trait VisualEngine {
     fn render(&mut self, ctx: RenderCtx, quality: Quality, scale: usize) -> &[u8];
 }
 
-pub struct PresetEngine {
-    presets: Vec<Box<dyn Preset>>,
-    playlist: Vec<usize>,
-    active: usize,
-    next: Option<usize>,
-    shuffle: bool,
-    switch_mode: SwitchMode,
-    last_auto_mode: SwitchMode,
-    beats_per_switch: u32,
-    seconds_per_switch: f32,
-    last_switch: Instant,
-    beat_counter: u32,
-    transition_started: Option<Instant>,
-    transition_dur: Duration,
-    transition_kind: TransitionKind,
-    transition_seed: u32,
-    transition_mode: TransitionMode,
-    last_transition_kind: TransitionKind,
-    transition_override: Option<TransitionKind>,
-    fractal_zoom_mode: FractalZoomMode,
-    fractal_zoom_drive: f32,
-    fractal_zoom_enabled: bool,
-    fractal_bias: bool,
-    scene_section: SceneSection,
-    scene_section_pending: SceneSection,
-    scene_section_votes: u8,
-    scene_section_changed_at: Instant,
-    camera_path_mode: CameraPathMode,
-    camera_path_speed: f32,
-
-    // Buffers
-    front: Vec<u8>,
-    back: Vec<u8>,
-    tmp_a: Vec<u8>,
-    tmp_b: Vec<u8>,
-    w: usize,
-    h: usize,
+pub(crate) struct PlaybackContext {
+    pub playlist: Vec<usize>,
+    pub active: usize,
+    pub next: Option<usize>,
+    pub shuffle: bool,
+    pub switch_mode: SwitchMode,
+    pub last_auto_mode: SwitchMode,
+    pub beats_per_switch: u32,
+    pub seconds_per_switch: f32,
+    pub last_switch: Instant,
+    pub beat_counter: u32,
+    pub transition_started: Option<Instant>,
+    pub transition_dur: Duration,
+    pub transition_kind: TransitionKind,
+    pub transition_seed: u32,
+    pub transition_mode: TransitionMode,
+    pub last_transition_kind: TransitionKind,
+    pub transition_override: Option<TransitionKind>,
+    pub fractal_zoom_mode: FractalZoomMode,
+    pub fractal_zoom_drive: f32,
+    pub fractal_zoom_enabled: bool,
+    pub fractal_bias: bool,
+    pub scene_section: SceneSection,
+    pub scene_section_pending: SceneSection,
+    pub scene_section_votes: u8,
+    pub scene_section_changed_at: Instant,
+    pub camera_path_mode: CameraPathMode,
+    pub camera_path_speed: f32,
+    preset_count: usize,
 }
 
-impl PresetEngine {
+impl PlaybackContext {
     pub fn new(
-        presets: Vec<Box<dyn Preset>>,
+        preset_count: usize,
         active: usize,
         shuffle: bool,
         switch_mode: SwitchMode,
@@ -862,11 +854,9 @@ impl PresetEngine {
         } else {
             switch_mode
         };
-        let preset_count = presets.len();
         Self {
-            presets,
             playlist: (0..preset_count).collect(),
-            active,
+            active: active.min(preset_count.saturating_sub(1)),
             next: None,
             shuffle,
             switch_mode,
@@ -892,62 +882,27 @@ impl PresetEngine {
             scene_section_changed_at: now,
             camera_path_mode: CameraPathMode::Auto,
             camera_path_speed: 1.0,
-            front: Vec::new(),
-            back: Vec::new(),
-            tmp_a: Vec::new(),
-            tmp_b: Vec::new(),
-            w: 0,
-            h: 0,
+            preset_count,
         }
-    }
-
-    pub fn resize(&mut self, w: usize, h: usize) {
-        self.w = w;
-        self.h = h;
-        let n = w.saturating_mul(h).saturating_mul(4);
-        self.front.resize(n, 0);
-        self.back.resize(n, 0);
-        self.tmp_a.resize(n, 0);
-        self.tmp_b.resize(n, 0);
-        self.clear();
-        for p in &mut self.presets {
-            p.on_resize(w, h);
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.front.fill(0);
-        self.back.fill(0);
-        self.tmp_a.fill(0);
-        self.tmp_b.fill(0);
-    }
-
-    pub fn preset_name(&self) -> &'static str {
-        self.presets
-            .get(self.active)
-            .map(|p| p.name())
-            .unwrap_or("<none>")
     }
 
     pub fn set_playlist_indices(&mut self, indices: &[usize]) {
-        if self.presets.is_empty() {
+        if self.preset_count == 0 {
             self.playlist.clear();
             return;
         }
-
-        let mut seen = vec![false; self.presets.len()];
+        let mut seen = vec![false; self.preset_count];
         let mut playlist = Vec::with_capacity(indices.len().max(1));
         for &idx in indices {
-            if idx < self.presets.len() && !seen[idx] {
+            if idx < self.preset_count && !seen[idx] {
                 seen[idx] = true;
                 playlist.push(idx);
             }
         }
         if playlist.is_empty() {
-            playlist.extend(0..self.presets.len());
+            playlist.extend(0..self.preset_count);
         }
         self.playlist = playlist;
-
         if !self.playlist.contains(&self.active) {
             self.active = self.playlist[0];
             self.next = None;
@@ -955,10 +910,6 @@ impl PresetEngine {
             self.transition_kind = TransitionKind::Fade;
             self.last_transition_kind = TransitionKind::Fade;
         }
-    }
-
-    pub fn renderer_hint(&self) -> &'static str {
-        "use arrows to switch presets"
     }
 
     pub fn set_shuffle(&mut self, on: bool) {
@@ -977,16 +928,12 @@ impl PresetEngine {
         self.transition_mode
     }
 
-    pub fn transition_mode_name(&self) -> &'static str {
-        self.transition_mode.label()
-    }
-
     pub fn transition_kind_name(&self) -> &'static str {
-        self.transition_kind.label()
-    }
-
-    pub fn transition_operator_name(&self) -> &'static str {
-        self.transition_kind.operator_label()
+        if let Some(k) = self.transition_override {
+            k.label()
+        } else {
+            self.transition_kind.label()
+        }
     }
 
     pub fn transition_selection_name(&self) -> &'static str {
@@ -1023,10 +970,6 @@ impl PresetEngine {
 
     pub fn camera_path_mode(&self) -> CameraPathMode {
         self.camera_path_mode
-    }
-
-    pub fn camera_path_mode_name(&self) -> &'static str {
-        self.camera_path_mode.label()
     }
 
     pub fn step_camera_path_speed(&mut self, delta: f32) {
@@ -1103,10 +1046,7 @@ impl PresetEngine {
     }
 
     fn playlist_pos_for_active(&self) -> usize {
-        self.playlist
-            .iter()
-            .position(|&i| i == self.active)
-            .unwrap_or(0)
+        self.playlist.iter().position(|&i| i == self.active).unwrap_or(0)
     }
 
     fn pick_shuffle(&mut self) -> usize {
@@ -1116,7 +1056,6 @@ impl PresetEngine {
         if self.playlist.len() == 1 {
             return self.playlist[0];
         }
-        // No immediate repeats within the active playlist.
         let mut idx = self.playlist[fastrand::usize(..self.playlist.len())];
         if idx == self.active {
             let pos = self.playlist_pos_for_active();
@@ -1151,43 +1090,10 @@ impl PresetEngine {
         self.start_transition(next);
     }
 
-    fn pick_fractal_index(&mut self) -> Option<usize> {
-        if self.playlist.len() <= 1 {
-            return None;
-        }
-        let fractals = self
-            .playlist
-            .iter()
-            .copied()
-            .filter_map(|i| {
-                if i != self.active && is_fractal_preset_name(self.presets[i].name()) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        if fractals.is_empty() {
-            return None;
-        }
-        if self.shuffle {
-            return Some(fractals[fastrand::usize(..fractals.len())]);
-        }
-        let pos = self.playlist_pos_for_active();
-        for d in 1..self.playlist.len() {
-            let idx = self.playlist[(pos + d) % self.playlist.len()];
-            if idx != self.active && is_fractal_preset_name(self.presets[idx].name()) {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
-    fn start_transition(&mut self, next: usize) {
-        if next == self.active || self.presets.is_empty() {
+    pub fn start_transition(&mut self, next: usize) {
+        if next == self.active || self.preset_count == 0 {
             return;
         }
-        // Manual transitions keep a consistent feel.
         self.transition_seed = fastrand::u32(..);
         self.transition_kind = if let Some(k) = self.transition_override {
             k
@@ -1206,8 +1112,8 @@ impl PresetEngine {
         self.beat_counter = 0;
     }
 
-    fn start_transition_with_dur(&mut self, next: usize, dur: Duration, kind: TransitionKind) {
-        if next == self.active || self.presets.is_empty() {
+    pub fn start_transition_with_dur(&mut self, next: usize, dur: Duration, kind: TransitionKind) {
+        if next == self.active || self.preset_count == 0 {
             return;
         }
         self.transition_dur = dur.clamp(Duration::from_millis(80), Duration::from_millis(2600));
@@ -1220,7 +1126,39 @@ impl PresetEngine {
         self.beat_counter = 0;
     }
 
-    fn next_preset_auto(&mut self, audio: &AudioFeatures) {
+    pub fn pick_fractal_index(&mut self, name_of: impl Fn(usize) -> &'static str) -> Option<usize> {
+        if self.playlist.len() <= 1 {
+            return None;
+        }
+        let fractals = self
+            .playlist
+            .iter()
+            .copied()
+            .filter_map(|i| {
+                if i != self.active && is_fractal_preset_name(name_of(i)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if fractals.is_empty() {
+            return None;
+        }
+        if self.shuffle {
+            return Some(fractals[fastrand::usize(..fractals.len())]);
+        }
+        let pos = self.playlist_pos_for_active();
+        for d in 1..self.playlist.len() {
+            let idx = self.playlist[(pos + d) % self.playlist.len()];
+            if idx != self.active && is_fractal_preset_name(name_of(idx)) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn next_preset_auto(&mut self, audio: &AudioFeatures, name_of: impl Fn(usize) -> &'static str) {
         if self.playlist.is_empty() {
             return;
         }
@@ -1235,7 +1173,7 @@ impl PresetEngine {
             && self.scene_section == SceneSection::Calm
             && fastrand::f32() < 0.78
         {
-            if let Some(fr) = self.pick_fractal_index() {
+            if let Some(fr) = self.pick_fractal_index(&name_of) {
                 next = fr;
             }
         }
@@ -1278,7 +1216,12 @@ impl PresetEngine {
         }
     }
 
-    pub fn update_auto_switch(&mut self, now: Instant, audio: &AudioFeatures) {
+    pub fn update_auto_switch(
+        &mut self,
+        now: Instant,
+        audio: &AudioFeatures,
+        name_of: impl Fn(usize) -> &'static str,
+    ) {
         self.update_scene_section_state(now, audio);
 
         if self.switch_mode == SwitchMode::Manual {
@@ -1293,9 +1236,10 @@ impl PresetEngine {
             SwitchMode::Beat => {
                 if audio.beat {
                     self.beat_counter = self.beat_counter.wrapping_add(1);
-                    let beats_per = section_beats_per_switch(self.beats_per_switch, self.scene_section);
+                    let beats_per =
+                        section_beats_per_switch(self.beats_per_switch, self.scene_section);
                     if self.beat_counter % beats_per == 0 {
-                        self.next_preset_auto(audio);
+                        self.next_preset_auto(audio, &name_of);
                     }
                 }
             }
@@ -1304,18 +1248,17 @@ impl PresetEngine {
                 let since = now.duration_since(self.last_switch).as_secs_f32();
                 let (energy_gate, min_since) = section_energy_gate(self.scene_section);
                 if e > energy_gate && since > min_since {
-                    self.next_preset_auto(audio);
+                    self.next_preset_auto(audio, &name_of);
                 }
             }
             SwitchMode::Time => {
                 let target = (self.seconds_per_switch * section_time_scale(self.scene_section))
                     .clamp(2.0, 60.0);
                 if now.duration_since(self.last_switch).as_secs_f32() > target {
-                    self.next_preset_auto(audio);
+                    self.next_preset_auto(audio, &name_of);
                 }
             }
             SwitchMode::Adaptive => {
-                // Hybrid: tempo-ish switching on strong beats, otherwise time/energy driven.
                 let since = now.duration_since(self.last_switch).as_secs_f32();
                 let treb = (audio.bands[5] + audio.bands[6] + audio.bands[7]) * (1.0 / 3.0);
                 let hit = audio.onset.max(audio.beat_strength).max(treb);
@@ -1343,15 +1286,112 @@ impl PresetEngine {
                     SceneSection::Drive => 0.80,
                     SceneSection::Impact => 0.74,
                 };
-                let slam =
-                    (audio.beat && audio.beat_strength > slam_gate) || audio.onset > (slam_gate - 0.04);
+                let slam = (audio.beat && audio.beat_strength > slam_gate)
+                    || audio.onset > (slam_gate - 0.04);
                 if slam && since > min_since {
-                    self.next_preset_auto(audio);
+                    self.next_preset_auto(audio, &name_of);
                 } else if since > target {
-                    self.next_preset_auto(audio);
+                    self.next_preset_auto(audio, &name_of);
                 }
             }
         }
+    }
+
+    /// Advance transition state; returns current blend alpha (0.0 if no transition active).
+    pub fn step_transition(&mut self, now: Instant) -> f32 {
+        if let (Some(start), Some(next)) = (self.transition_started, self.next) {
+            let t = now.duration_since(start).as_secs_f32() / self.transition_dur.as_secs_f32();
+            if t >= 1.0 {
+                self.active = next;
+                self.next = None;
+                self.transition_started = None;
+                self.transition_kind = TransitionKind::Fade;
+                0.0
+            } else {
+                t.clamp(0.0, 1.0)
+            }
+        } else {
+            0.0
+        }
+    }
+
+    pub fn fractal_zoom_mul(&self) -> f32 {
+        if self.fractal_zoom_enabled {
+            self.fractal_zoom_mode.multiplier() * self.fractal_zoom_drive
+        } else {
+            -1.0
+        }
+    }
+}
+
+pub struct PresetEngine {
+    presets: Vec<Box<dyn Preset>>,
+    ctx: PlaybackContext,
+
+    // Buffers
+    front: Vec<u8>,
+    back: Vec<u8>,
+    tmp_a: Vec<u8>,
+    tmp_b: Vec<u8>,
+    w: usize,
+    h: usize,
+}
+
+impl PresetEngine {
+    pub fn new(
+        presets: Vec<Box<dyn Preset>>,
+        active: usize,
+        shuffle: bool,
+        switch_mode: SwitchMode,
+        beats_per_switch: u32,
+        seconds_per_switch: f32,
+    ) -> Self {
+        let preset_count = presets.len();
+        Self {
+            ctx: PlaybackContext::new(
+                preset_count,
+                active,
+                shuffle,
+                switch_mode,
+                beats_per_switch,
+                seconds_per_switch,
+            ),
+            presets,
+            front: Vec::new(),
+            back: Vec::new(),
+            tmp_a: Vec::new(),
+            tmp_b: Vec::new(),
+            w: 0,
+            h: 0,
+        }
+    }
+
+    pub fn resize(&mut self, w: usize, h: usize) {
+        self.w = w;
+        self.h = h;
+        let n = w.saturating_mul(h).saturating_mul(4);
+        self.front.resize(n, 0);
+        self.back.resize(n, 0);
+        self.tmp_a.resize(n, 0);
+        self.tmp_b.resize(n, 0);
+        self.clear();
+        for p in &mut self.presets {
+            p.on_resize(w, h);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.front.fill(0);
+        self.back.fill(0);
+        self.tmp_a.fill(0);
+        self.tmp_b.fill(0);
+    }
+
+    pub fn preset_name(&self) -> &'static str {
+        self.presets
+            .get(self.ctx.active)
+            .map(|p| p.name())
+            .unwrap_or("<none>")
     }
 
     pub fn render(
@@ -1366,42 +1406,25 @@ impl PresetEngine {
 
         ctx.quality = quality;
         ctx.scale = scale.max(1);
-        ctx.fractal_zoom_mul = if self.fractal_zoom_enabled {
-            self.fractal_zoom_mode.multiplier() * self.fractal_zoom_drive
-        } else {
-            -1.0
-        };
+        ctx.fractal_zoom_mul = self.ctx.fractal_zoom_mul();
 
-        let alpha = if let (Some(start), Some(next)) = (self.transition_started, self.next) {
-            let t = ctx.now.duration_since(start).as_secs_f32() / self.transition_dur.as_secs_f32();
-            if t >= 1.0 {
-                self.active = next;
-                self.next = None;
-                self.transition_started = None;
-                self.transition_kind = TransitionKind::Fade;
-                0.0
-            } else {
-                t.clamp(0.0, 1.0)
-            }
-        } else {
-            0.0
-        };
+        let alpha = self.ctx.step_transition(ctx.now);
 
         if alpha == 0.0 {
-            self.presets[self.active].render(&ctx, &self.front, &mut self.back);
+            self.presets[self.ctx.active].render(&ctx, &self.front, &mut self.back);
         } else {
-            let next = self.next.unwrap_or(self.active);
-            self.presets[self.active].render(&ctx, &self.front, &mut self.tmp_a);
+            let next = self.ctx.next.unwrap_or(self.ctx.active);
+            self.presets[self.ctx.active].render(&ctx, &self.front, &mut self.tmp_a);
             self.presets[next].render(&ctx, &self.front, &mut self.tmp_b);
             blend_transition(
-                self.transition_kind,
+                self.ctx.transition_kind,
                 &self.front,
                 &self.tmp_a,
                 &self.tmp_b,
                 alpha,
                 ctx.t,
                 &ctx.audio,
-                self.transition_seed,
+                self.ctx.transition_seed,
                 self.w,
                 self.h,
                 &mut self.back,
@@ -1423,143 +1446,43 @@ impl VisualEngine for PresetEngine {
     }
 
     fn set_playlist_indices(&mut self, indices: &[usize]) {
-        PresetEngine::set_playlist_indices(self, indices)
+        self.ctx.set_playlist_indices(indices)
     }
 
-    fn set_shuffle(&mut self, on: bool) {
-        PresetEngine::set_shuffle(self, on)
-    }
-
-    fn toggle_shuffle(&mut self) {
-        PresetEngine::toggle_shuffle(self)
-    }
-
-    fn cycle_transition_mode(&mut self) {
-        PresetEngine::cycle_transition_mode(self)
-    }
-
-    fn transition_mode(&self) -> TransitionMode {
-        PresetEngine::transition_mode(self)
-    }
-
-    fn transition_mode_name(&self) -> &'static str {
-        PresetEngine::transition_mode_name(self)
-    }
-
-    fn transition_kind_name(&self) -> &'static str {
-        PresetEngine::transition_kind_name(self)
-    }
-
-    fn transition_operator_name(&self) -> &'static str {
-        PresetEngine::transition_operator_name(self)
-    }
-
-    fn transition_selection_name(&self) -> &'static str {
-        PresetEngine::transition_selection_name(self)
-    }
-
-    fn transition_selection_locked(&self) -> bool {
-        PresetEngine::transition_selection_locked(self)
-    }
-
-    fn next_transition_kind(&mut self) {
-        PresetEngine::next_transition_kind(self)
-    }
-
-    fn prev_transition_kind(&mut self) {
-        PresetEngine::prev_transition_kind(self)
-    }
-
-    fn scene_section_name(&self) -> &'static str {
-        PresetEngine::scene_section_name(self)
-    }
-
-    fn cycle_camera_path_mode(&mut self) {
-        PresetEngine::cycle_camera_path_mode(self)
-    }
-
-    fn step_camera_path_mode(&mut self, forward: bool) {
-        PresetEngine::step_camera_path_mode(self, forward)
-    }
-
-    fn camera_path_mode(&self) -> CameraPathMode {
-        PresetEngine::camera_path_mode(self)
-    }
-
-    fn camera_path_mode_name(&self) -> &'static str {
-        PresetEngine::camera_path_mode_name(self)
-    }
-
-    fn step_camera_path_speed(&mut self, delta: f32) {
-        PresetEngine::step_camera_path_speed(self, delta)
-    }
-
-    fn camera_path_speed(&self) -> f32 {
-        PresetEngine::camera_path_speed(self)
-    }
-
-    fn toggle_fractal_bias(&mut self) {
-        PresetEngine::toggle_fractal_bias(self)
-    }
-
-    fn fractal_bias(&self) -> bool {
-        PresetEngine::fractal_bias(self)
-    }
-
-    fn cycle_fractal_zoom_mode(&mut self) {
-        PresetEngine::cycle_fractal_zoom_mode(self)
-    }
-
-    fn fractal_zoom_mode(&self) -> FractalZoomMode {
-        PresetEngine::fractal_zoom_mode(self)
-    }
-
-    fn set_fractal_zoom_drive(&mut self, v: f32) {
-        PresetEngine::set_fractal_zoom_drive(self, v)
-    }
-
-    fn fractal_zoom_drive(&self) -> f32 {
-        PresetEngine::fractal_zoom_drive(self)
-    }
-
-    fn toggle_fractal_zoom_enabled(&mut self) {
-        PresetEngine::toggle_fractal_zoom_enabled(self)
-    }
-
-    fn fractal_zoom_enabled(&self) -> bool {
-        PresetEngine::fractal_zoom_enabled(self)
-    }
-
-    fn toggle_auto_switch(&mut self) {
-        PresetEngine::toggle_auto_switch(self)
-    }
-
-    fn set_switch_mode(&mut self, m: SwitchMode) {
-        PresetEngine::set_switch_mode(self, m)
-    }
-
-    fn switch_mode(&self) -> SwitchMode {
-        PresetEngine::switch_mode(self)
-    }
-
-    fn shuffle(&self) -> bool {
-        PresetEngine::shuffle(self)
-    }
-
-    fn auto_switch(&self) -> bool {
-        PresetEngine::auto_switch(self)
-    }
-
-    fn prev_preset(&mut self) {
-        PresetEngine::prev_preset(self)
-    }
-
-    fn next_preset(&mut self) {
-        PresetEngine::next_preset(self)
-    }
+    fn set_shuffle(&mut self, on: bool) { self.ctx.set_shuffle(on) }
+    fn toggle_shuffle(&mut self) { self.ctx.toggle_shuffle() }
+    fn cycle_transition_mode(&mut self) { self.ctx.cycle_transition_mode() }
+    fn transition_mode(&self) -> TransitionMode { self.ctx.transition_mode() }
+    fn transition_kind_name(&self) -> &'static str { self.ctx.transition_kind_name() }
+    fn transition_selection_name(&self) -> &'static str { self.ctx.transition_selection_name() }
+    fn transition_selection_locked(&self) -> bool { self.ctx.transition_selection_locked() }
+    fn next_transition_kind(&mut self) { self.ctx.next_transition_kind() }
+    fn prev_transition_kind(&mut self) { self.ctx.prev_transition_kind() }
+    fn scene_section_name(&self) -> &'static str { self.ctx.scene_section_name() }
+    fn cycle_camera_path_mode(&mut self) { self.ctx.cycle_camera_path_mode() }
+    fn step_camera_path_mode(&mut self, forward: bool) { self.ctx.step_camera_path_mode(forward) }
+    fn camera_path_mode(&self) -> CameraPathMode { self.ctx.camera_path_mode() }
+    fn step_camera_path_speed(&mut self, delta: f32) { self.ctx.step_camera_path_speed(delta) }
+    fn camera_path_speed(&self) -> f32 { self.ctx.camera_path_speed() }
+    fn toggle_fractal_bias(&mut self) { self.ctx.toggle_fractal_bias() }
+    fn fractal_bias(&self) -> bool { self.ctx.fractal_bias() }
+    fn cycle_fractal_zoom_mode(&mut self) { self.ctx.cycle_fractal_zoom_mode() }
+    fn fractal_zoom_mode(&self) -> FractalZoomMode { self.ctx.fractal_zoom_mode() }
+    fn set_fractal_zoom_drive(&mut self, v: f32) { self.ctx.set_fractal_zoom_drive(v) }
+    fn fractal_zoom_drive(&self) -> f32 { self.ctx.fractal_zoom_drive() }
+    fn toggle_fractal_zoom_enabled(&mut self) { self.ctx.toggle_fractal_zoom_enabled() }
+    fn fractal_zoom_enabled(&self) -> bool { self.ctx.fractal_zoom_enabled() }
+    fn toggle_auto_switch(&mut self) { self.ctx.toggle_auto_switch() }
+    fn set_switch_mode(&mut self, m: SwitchMode) { self.ctx.set_switch_mode(m) }
+    fn switch_mode(&self) -> SwitchMode { self.ctx.switch_mode() }
+    fn shuffle(&self) -> bool { self.ctx.shuffle() }
+    fn auto_switch(&self) -> bool { self.ctx.auto_switch() }
+    fn prev_preset(&mut self) { self.ctx.prev_preset() }
+    fn next_preset(&mut self) { self.ctx.next_preset() }
 
     fn update_auto_switch(&mut self, now: Instant, audio: &AudioFeatures) {
-        PresetEngine::update_auto_switch(self, now, audio)
+        let presets = &self.presets;
+        self.ctx.update_auto_switch(now, audio, |i| presets[i].name())
     }
 
     fn render(&mut self, ctx: RenderCtx, quality: Quality, scale: usize) -> &[u8] {

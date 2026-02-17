@@ -1,4 +1,6 @@
-use crate::render::{draw_overlay_popup, write_hud_line, Frame, Renderer};
+use crate::render::{
+    luma_u16, text_frame_begin, text_frame_end, write_bg_rgb, write_fg_rgb, Frame, Renderer,
+};
 use std::io::Write;
 
 pub struct SextantRenderer {
@@ -21,48 +23,13 @@ impl Renderer for SextantRenderer {
     }
 
     fn render(&mut self, frame: &Frame<'_>, out: &mut dyn Write) -> anyhow::Result<()> {
-        let cols = frame.term_cols as usize;
-        let visual_rows = frame.visual_rows as usize;
-        let w = frame.pixel_width;
-        let h = frame.pixel_height;
-
-        if cols == 0 || visual_rows == 0 || w == 0 || h == 0 {
+        let Some((cols, visual_rows, w, _h)) = text_frame_begin(frame, 2, 3, out)? else {
             return Ok(());
-        }
-        if w != cols.saturating_mul(2) || h != visual_rows.saturating_mul(3) {
-            return Ok(());
-        }
+        };
 
-        let need = w.saturating_mul(h).saturating_mul(4);
-        if frame.pixels_rgba.len() < need {
-            if frame.sync_updates {
-                out.write_all(b"\x1b[?2026h")?;
-            }
-            out.write_all(b"\x1b[H\x1b[0m\x1b[2J")?;
-            write!(
-                out,
-                "pixel buffer too small (need {}, got {})",
-                need,
-                frame.pixels_rgba.len()
-            )?;
-            if frame.sync_updates {
-                out.write_all(b"\x1b[?2026l")?;
-            }
-            out.flush()?;
-            return Ok(());
-        }
-
-        if frame.sync_updates {
-            out.write_all(b"\x1b[?2026h")?;
-        }
-
-        out.write_all(b"\x1b[H\x1b[0m")?;
-        out.write_all(b"\x1b[?7l")?;
         self.last_fg = None;
         self.last_bg = None;
 
-        // 2x3 dot order mapped into the first six braille dots.
-        // left: 1,2,3  right: 4,5,6
         const DOT_BITS: [u8; 6] = [0x01, 0x08, 0x02, 0x10, 0x04, 0x20];
 
         for row in 0..visual_rows {
@@ -148,46 +115,20 @@ impl Renderer for SextantRenderer {
                 };
 
                 if self.last_fg != Some(fgc) {
-                    write!(out, "\x1b[38;2;{};{};{}m", fgc.0, fgc.1, fgc.2)?;
+                    write_fg_rgb(out, fgc.0, fgc.1, fgc.2)?;
                     self.last_fg = Some(fgc);
                 }
                 if self.last_bg != Some(bgc) {
-                    write!(out, "\x1b[48;2;{};{};{}m", bgc.0, bgc.1, bgc.2)?;
+                    write_bg_rgb(out, bgc.0, bgc.1, bgc.2)?;
                     self.last_bg = Some(bgc);
                 }
-                write!(out, "{ch}")?;
+                let mut ch_buf = [0u8; 4];
+                let ch_str = ch.encode_utf8(&mut ch_buf);
+                out.write_all(ch_str.as_bytes())?;
             }
             out.write_all(b"\r\n")?;
         }
 
-        let mut hud_lines = frame.hud.lines();
-        for i in 0..(frame.hud_rows as usize) {
-            write_hud_line(
-                out,
-                visual_rows + i + 1,
-                cols,
-                hud_lines.next(),
-                frame.hud_highlight,
-                frame.hud_highlight_phase,
-            )?;
-        }
-
-        if let Some(text) = frame.overlay {
-            draw_overlay_popup(out, frame.term_cols, frame.term_rows, text)?;
-        }
-
-        out.write_all(b"\x1b[?7h")?;
-
-        if frame.sync_updates {
-            out.write_all(b"\x1b[?2026l")?;
-        }
-        out.flush()?;
-        Ok(())
+        text_frame_end(frame, cols, visual_rows, out)
     }
-}
-
-#[inline]
-fn luma_u16(r: u8, g: u8, b: u8) -> u16 {
-    let y = (r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8;
-    y as u16
 }

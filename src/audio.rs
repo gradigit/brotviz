@@ -91,6 +91,7 @@ impl AtomicAudioFeatures {
         loop {
             let v1 = self.seq.load(Ordering::Acquire);
             if v1 & 1 == 1 {
+                std::hint::spin_loop();
                 continue;
             }
 
@@ -440,6 +441,7 @@ fn push_audio_f32(list: &AudioBufferList, channels: usize, prod: &mut ringbuf::H
                 return;
             }
             let n = data.len() / 4;
+            debug_assert!(data.as_ptr().align_offset(std::mem::align_of::<f32>()) == 0);
             let samples: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), n) };
 
             let ch = (buf.number_channels as usize).max(1);
@@ -464,6 +466,7 @@ fn push_audio_f32(list: &AudioBufferList, channels: usize, prod: &mut ringbuf::H
             continue;
         }
         let n = data.len() / 4;
+        debug_assert!(data.as_ptr().align_offset(std::mem::align_of::<f32>()) == 0);
         let samples: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), n) };
         chans.push(samples);
         if chans.len() >= channels {
@@ -498,6 +501,7 @@ fn push_audio_i16(list: &AudioBufferList, channels: usize, prod: &mut ringbuf::H
                 return;
             }
             let n = data.len() / 2;
+            debug_assert!(data.as_ptr().align_offset(std::mem::align_of::<i16>()) == 0);
             let samples: &[i16] = unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), n) };
 
             let ch = (buf.number_channels as usize).max(1);
@@ -521,6 +525,7 @@ fn push_audio_i16(list: &AudioBufferList, channels: usize, prod: &mut ringbuf::H
             continue;
         }
         let n = data.len() / 2;
+        debug_assert!(data.as_ptr().align_offset(std::mem::align_of::<i16>()) == 0);
         let samples: &[i16] = unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), n) };
         chans.push(samples);
         if chans.len() >= channels {

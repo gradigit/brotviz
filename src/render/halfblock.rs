@@ -1,4 +1,4 @@
-use crate::render::{draw_overlay_popup, write_hud_line, Frame, Renderer};
+use crate::render::{text_frame_begin, text_frame_end, write_bg_rgb, write_fg_rgb, Frame, Renderer};
 use std::io::Write;
 
 pub struct HalfBlockRenderer {
@@ -21,52 +21,12 @@ impl Renderer for HalfBlockRenderer {
     }
 
     fn render(&mut self, frame: &Frame<'_>, out: &mut dyn Write) -> anyhow::Result<()> {
-        let cols = frame.term_cols as usize;
-        let visual_rows = frame.visual_rows as usize;
-        let w = frame.pixel_width;
-        let h = frame.pixel_height;
-
-        if cols == 0 || visual_rows == 0 || w == 0 || h == 0 {
+        let Some((cols, visual_rows, w, _h)) = text_frame_begin(frame, 1, 2, out)? else {
             return Ok(());
-        }
-        if w != cols || h != visual_rows.saturating_mul(2) {
-            // Internal mismatch; avoid panics.
-            return Ok(());
-        }
+        };
 
-        let need = w.saturating_mul(h).saturating_mul(4);
-        if frame.pixels_rgba.len() < need {
-            // Defensive: don't index out of bounds; show a HUD so it's obvious.
-            if frame.sync_updates {
-                out.write_all(b"\x1b[?2026h")?;
-            }
-            out.write_all(b"\x1b[H\x1b[0m\x1b[2J")?;
-            write!(
-                out,
-                "pixel buffer too small (need {}, got {})",
-                need,
-                frame.pixels_rgba.len()
-            )?;
-            if frame.sync_updates {
-                out.write_all(b"\x1b[?2026l")?;
-            }
-            out.flush()?;
-            return Ok(());
-        }
-
-        if frame.sync_updates {
-            out.write_all(b"\x1b[?2026h")?;
-        }
-
-        // Home, reset
-        out.write_all(b"\x1b[H\x1b[0m")?;
-        // Disable autowrap (DECAWM) while we paint full-width rows; some terminals will otherwise
-        // wrap when the last column is written, and the subsequent newline creates visible gaps.
-        out.write_all(b"\x1b[?7l")?;
         self.last_fg = None;
         self.last_bg = None;
-
-        const HALF_BLOCK: char = '\u{2580}';
 
         for row in 0..visual_rows {
             let top_y = row * 2;
@@ -86,43 +46,18 @@ impl Renderer for HalfBlockRenderer {
                 );
 
                 if self.last_fg != Some((tr, tg, tb)) {
-                    write!(out, "\x1b[38;2;{};{};{}m", tr, tg, tb)?;
+                    write_fg_rgb(out, tr, tg, tb)?;
                     self.last_fg = Some((tr, tg, tb));
                 }
                 if self.last_bg != Some((br, bg, bb)) {
-                    write!(out, "\x1b[48;2;{};{};{}m", br, bg, bb)?;
+                    write_bg_rgb(out, br, bg, bb)?;
                     self.last_bg = Some((br, bg, bb));
                 }
-                write!(out, "{HALF_BLOCK}")?;
+                out.write_all("\u{2580}".as_bytes())?;
             }
-            // Next line (CRLF) with autowrap disabled.
             out.write_all(b"\r\n")?;
         }
 
-        // HUD lines (bottom area)
-        let mut hud_lines = frame.hud.lines();
-        for i in 0..(frame.hud_rows as usize) {
-            write_hud_line(
-                out,
-                visual_rows + i + 1,
-                cols,
-                hud_lines.next(),
-                frame.hud_highlight,
-                frame.hud_highlight_phase,
-            )?;
-        }
-
-        if let Some(text) = frame.overlay {
-            draw_overlay_popup(out, frame.term_cols, frame.term_rows, text)?;
-        }
-
-        // Restore autowrap.
-        out.write_all(b"\x1b[?7h")?;
-
-        if frame.sync_updates {
-            out.write_all(b"\x1b[?2026l")?;
-        }
-        out.flush()?;
-        Ok(())
+        text_frame_end(frame, cols, visual_rows, out)
     }
 }

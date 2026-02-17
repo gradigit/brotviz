@@ -80,7 +80,9 @@ impl AppPrefs {
             "# tui_visualizer runtime prefs v1\nstage_mode={}\n",
             if self.stage_mode { "true" } else { "false" }
         );
-        std::fs::write(path, body).map_err(|e| PrefsError::Io(e.to_string()))
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &body).map_err(|e| PrefsError::Io(e.to_string()))?;
+        std::fs::rename(&tmp, path).map_err(|e| PrefsError::Io(e.to_string()))
     }
 }
 

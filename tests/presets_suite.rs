@@ -2,7 +2,9 @@ use std::time::{Duration, Instant};
 
 use tui_visualizer::audio::AudioFeatures;
 use tui_visualizer::config::{Quality, SwitchMode};
-use tui_visualizer::visual::{make_presets, CameraPathMode, Preset, PresetEngine, RenderCtx};
+use tui_visualizer::visual::{
+    make_presets, CameraPathMode, Preset, PresetEngine, RenderCtx, VisualEngine,
+};
 
 fn synth_audio(t: f32, step: usize) -> AudioFeatures {
     let bass = ((t * 2.0).sin() * 0.5 + 0.5).powf(1.1);
