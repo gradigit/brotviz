@@ -1,6 +1,15 @@
 version: 1
-last_synced: "2026-02-15T16:10:00Z"
+last_synced: "2026-02-17T12:12:17Z"
 documents:
+  - path: CLAUDE.md
+    type: session-context
+    references:
+      - Cargo.toml
+      - src/app.rs
+      - src/audio.rs
+      - src/config.rs
+      - src/visual/metal.rs
+      - src/visual/presets.rs
   - path: README.md
     type: overview
     references:

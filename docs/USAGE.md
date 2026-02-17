@@ -73,23 +73,23 @@ cargo run --bin tui_visualizer -- --list-devices
 - `--renderer half-block|braille|kitty`
 - `--fps <N>`
 - `--quality fast|balanced|high|ultra`
-- `--adaptive-quality true|false`
+- `--adaptive-quality=<true|false>` (or `--adaptive-quality` / `--no-adaptive-quality` where supported)
 - `--switch manual|beat|energy|time|adaptive`
-- `--shuffle true|false`
+- `--shuffle` (enable)
 - `--preset <index-or-substring>`
-- `--stage-mode true|false`
-- `--auto-probe true|false`
-- `--latency-calibration true|false`
+- `--stage-mode` (enable)
+- `--auto-probe=<true|false>`
+- `--latency-calibration` (enable)
 - `--latency-offset-ms <f32>`
 - `--theme-pack <path>`
 - `--control-matrix <path>`
 - `--preset-graph <path>`
 - `--lyrics-file <path>`
-- `--lyrics-loop true|false`
+- `--lyrics-loop=<true|false>`
 - `--lyrics-offset-ms <f32>`
 - `--system-data off|subtle|creep`
-- `--sync-updates true|false`
-- `--safe true|false`
+- `--sync-updates=<true|false>`
+- `--safe` (enable)
 
 Exporter-specific flags:
 - `--audio <wav>`

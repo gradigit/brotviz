@@ -70,6 +70,19 @@ CPU fallback:
 cargo run --release --bin tui_visualizer -- --source mic --engine cpu --renderer half-block
 ```
 
+## Promo video (Remotion)
+
+Create a short promo video from `promo/`:
+
+```sh
+cd promo
+npm install
+npm run render
+```
+
+Output:
+- `promo/out/brotviz-promo.mp4`
+
 ## Hotkeys
 
 - `Left` / `Right`: previous or next preset
