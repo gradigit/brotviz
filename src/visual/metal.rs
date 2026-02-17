@@ -11,6 +11,20 @@ use metal::*;
 use objc::rc::autoreleasepool;
 use std::time::{Duration, Instant};
 
+const METAL_PRESET_COUNT: usize = 56;
+const MANDEL_REF_MAX: usize = 896;
+const MANDEL_REF_SLOTS: usize = MANDEL_REF_MAX * 2;
+
+#[derive(Clone, Copy, Default)]
+struct MandelRefParams {
+    enabled: bool,
+    len: u32,
+    cx: f32,
+    cy: f32,
+    scale: f32,
+    depth: f32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Uniforms {
@@ -39,6 +53,23 @@ struct Uniforms {
     has_prev: u32,
     camera_path_mode: u32,
     camera_path_speed: f32,
+
+    active_ref_offset: u32,
+    active_ref_len: u32,
+    active_ref_enabled: u32,
+    next_ref_offset: u32,
+    next_ref_len: u32,
+    next_ref_enabled: u32,
+    _ref_pad0: [u32; 2],
+
+    active_ref_cx: f32,
+    active_ref_cy: f32,
+    active_ref_scale: f32,
+    active_ref_depth: f32,
+    next_ref_cx: f32,
+    next_ref_cy: f32,
+    next_ref_scale: f32,
+    next_ref_depth: f32,
 }
 
 pub struct MetalEngine {
@@ -86,11 +117,13 @@ pub struct MetalEngine {
     tex_a: Texture,
     tex_b: Texture,
     uniforms: Buffer,
+    mandel_orbits: Buffer,
 
     readback: Buffer,
     readback_bpr: usize,
     cpu_pixels: Vec<u8>,
     out_pixels: Vec<u8>,
+    mandel_orbit_cpu: Vec<[f32; 2]>,
 }
 
 impl MetalEngine {
@@ -129,6 +162,10 @@ impl MetalEngine {
 
         let uniforms = device.new_buffer(
             std::mem::size_of::<Uniforms>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let mandel_orbits = device.new_buffer(
+            (MANDEL_REF_SLOTS * std::mem::size_of::<[f32; 2]>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
 
@@ -185,10 +222,12 @@ impl MetalEngine {
             tex_a,
             tex_b,
             uniforms,
+            mandel_orbits,
             readback,
             readback_bpr,
             cpu_pixels,
             out_pixels: Vec::new(),
+            mandel_orbit_cpu: vec![[0.0; 2]; MANDEL_REF_SLOTS],
         })
     }
 
@@ -218,6 +257,172 @@ impl MetalEngine {
             self.transition_kind = TransitionKind::Fade;
             self.last_transition_kind = TransitionKind::Fade;
         }
+    }
+
+    fn map_name_to_shader_preset(name: &str, fallback: usize) -> u32 {
+        let n = name.to_ascii_lowercase();
+        if n.contains("mandelbrot: bass zoom") {
+            2
+        } else if n.contains("mandelbrot: infinite dive") {
+            40
+        } else if n.contains("mandelbrot: seahorse zoom") {
+            41
+        } else if n.contains("mandelbrot: spiral probe") {
+            38
+        } else {
+            (fallback % METAL_PRESET_COUNT) as u32
+        }
+    }
+
+    fn shader_preset_index(&self, idx: usize) -> u32 {
+        let fallback = idx % METAL_PRESET_COUNT;
+        self.preset_names
+            .get(idx)
+            .map(|name| Self::map_name_to_shader_preset(name, fallback))
+            .unwrap_or(fallback as u32)
+    }
+
+    #[inline]
+    fn fractal_motion_zoom_cpu(t: f32, zoom_mul: f32, bass: f32, beat: f32) -> f32 {
+        if zoom_mul <= 0.0 {
+            return 1.0;
+        }
+        let zm = zoom_mul.clamp(0.35, 2.5);
+        let rate = (0.09 + 0.07 * bass).max(0.01) * zm * (1.0 + 0.45 * beat.clamp(0.0, 1.0));
+        let lz = (1.0 + t.max(0.0) * rate).log2();
+        1.0 + (0.75 + 1.65 * zm) * lz
+    }
+
+    #[inline]
+    fn deep_zoom_pow_cpu(t: f32, speed: f32, zm: f32, beat: f32, base: f32, span: f32) -> f32 {
+        if zm <= 0.0 {
+            return base;
+        }
+        let z = zm.clamp(0.35, 2.5);
+        let mut sweep = t.max(0.0) * (0.12 + 0.22 * speed.max(0.0)) * z;
+        sweep *= 1.0 + 0.55 * beat.clamp(0.0, 1.0);
+        let lz = (1.0 + sweep).log2();
+        base + span * 0.12 * lz
+    }
+
+    fn build_mandel_ref_params(
+        preset: u32,
+        t: f32,
+        bass: f32,
+        mid: f32,
+        _treb: f32,
+        beat: f32,
+        zoom_mul: f32,
+        quality: u32,
+    ) -> MandelRefParams {
+        let p = preset % 56;
+        let (center, scale, depth, base_iters) = match p {
+            2 => {
+                let zf = Self::fractal_motion_zoom_cpu(t, zoom_mul, bass, beat);
+                let sc = 1.9 / zf.max(1e-6);
+                let drift = sc * (0.12 + 0.25 * bass + 0.10 * beat);
+                (
+                    (
+                        -0.743_643_9 + drift * (t * 0.24 + bass * 1.6).sin(),
+                        0.131_825_91 + drift * (t * 0.19 + mid * 1.4).cos(),
+                    ),
+                    sc,
+                    zf.max(1e-6).log2(),
+                    42 + quality * 30,
+                )
+            }
+            38 => {
+                let zf = Self::fractal_motion_zoom_cpu(t, zoom_mul, bass, beat);
+                let sc = 1.75 / zf.max(1e-6);
+                let drift = sc * (0.11 + 0.22 * bass + 0.10 * beat);
+                (
+                    (
+                        -0.761_574 + drift * (t * 0.22 + bass * 1.5).sin(),
+                        -0.084_759_6 + drift * (t * 0.18 + mid * 1.3).cos(),
+                    ),
+                    sc,
+                    zf.max(1e-6).log2(),
+                    44 + quality * 32,
+                )
+            }
+            40 => {
+                let zm = zoom_mul.clamp(0.35, 2.5);
+                let zpow = Self::deep_zoom_pow_cpu(t, 0.20 + 0.30 * bass, zm, beat, 1.6, 16.4);
+                let zoom = 2.0f32.powf(zpow);
+                let sc = 1.9 / zoom.max(1.0);
+                (
+                    (
+                        -0.743_643_9,
+                        0.131_825_91,
+                    ),
+                    sc,
+                    zpow.max(0.0),
+                    42 + quality * 56,
+                )
+            }
+            41 => {
+                let zm = zoom_mul.clamp(0.35, 2.5);
+                let zpow = Self::deep_zoom_pow_cpu(t, 0.18 + 0.28 * bass, zm, beat, 1.3, 16.3);
+                let zoom = 2.0f32.powf(zpow);
+                let sc = 1.8 / zoom.max(1.0);
+                (
+                    (
+                        -0.7453,
+                        0.1127,
+                    ),
+                    sc,
+                    zpow.max(0.0),
+                    40 + quality * 54,
+                )
+            }
+            _ => return MandelRefParams::default(),
+        };
+
+        let depth_ramp = (depth.max(0.0) * (16.0 + 5.0 * quality as f32)).min(560.0) as u32;
+        let len = (base_iters + depth_ramp).clamp(96, (MANDEL_REF_MAX - 1) as u32);
+        let enabled = match p {
+            40 | 41 => zoom_mul > 0.0,
+            2 => zoom_mul > 0.0,
+            38 => zoom_mul > 0.0,
+            _ => false,
+        };
+        MandelRefParams {
+            enabled,
+            len,
+            cx: center.0,
+            cy: center.1,
+            scale,
+            depth,
+        }
+    }
+
+    fn fill_mandel_ref_orbit(&mut self, offset: usize, params: MandelRefParams) -> u32 {
+        if !params.enabled {
+            return 0;
+        }
+        let max_len = MANDEL_REF_SLOTS.saturating_sub(offset).min(MANDEL_REF_MAX);
+        let mut len = (params.len as usize).clamp(16, max_len) as u32;
+        if len < 2 {
+            return 0;
+        }
+        let cr = params.cx as f64;
+        let ci = params.cy as f64;
+        let mut zr = 0.0f64;
+        let mut zi = 0.0f64;
+        let mut actual = len;
+        for i in 0..len as usize {
+            self.mandel_orbit_cpu[offset + i] = [zr as f32, zi as f32];
+            let zr2 = zr * zr - zi * zi + cr;
+            zi = 2.0 * zr * zi + ci;
+            zr = zr2;
+            let m2 = zr * zr + zi * zi;
+            if m2 > 256.0 {
+                actual = (i as u32 + 2).min(len);
+                break;
+            }
+        }
+        len = actual.max(2);
+        len
     }
 
     fn playlist_pos_for_active(&self) -> usize {
@@ -702,14 +907,61 @@ impl VisualEngine for MetalEngine {
             0.0
         };
 
-        let active = self.active as u32;
-        let next = self.next.unwrap_or(self.active) as u32;
+        let active = self.shader_preset_index(self.active);
+        let next = self.shader_preset_index(self.next.unwrap_or(self.active));
 
         let seed = if alpha == 0.0 {
             fastrand::u32(..)
         } else {
             self.transition_seed
         };
+        let quality_u32 = Self::quality_u32(quality);
+        let bass = ctx.audio.bands[1].clamp(0.0, 1.0);
+        let lowmid = ctx.audio.bands[2].clamp(0.0, 1.0);
+        let mid = (0.62 * ctx.audio.bands[3]
+            + 0.23 * lowmid
+            + 0.15 * ctx.audio.bands[4].clamp(0.0, 1.0))
+            .clamp(0.0, 1.0);
+        let treb = ctx.audio.bands[5].clamp(0.0, 1.0);
+        let beat = ctx.beat_pulse.clamp(0.0, 1.0);
+        let zoom_mul = if self.fractal_zoom_enabled {
+            self.fractal_zoom_mode.multiplier() * self.fractal_zoom_drive
+        } else {
+            -1.0
+        };
+
+        let active_params = Self::build_mandel_ref_params(
+            active,
+            ctx.t,
+            bass,
+            mid,
+            treb,
+            beat,
+            zoom_mul,
+            quality_u32,
+        );
+        let next_params = Self::build_mandel_ref_params(
+            next,
+            ctx.t,
+            bass,
+            mid,
+            treb,
+            beat,
+            zoom_mul,
+            quality_u32,
+        );
+        let active_ref_offset = 0u32;
+        let next_ref_offset = MANDEL_REF_MAX as u32;
+        let active_ref_len = self.fill_mandel_ref_orbit(active_ref_offset as usize, active_params);
+        let next_ref_len = self.fill_mandel_ref_orbit(next_ref_offset as usize, next_params);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.mandel_orbit_cpu.as_ptr().cast::<u8>(),
+                self.mandel_orbits.contents().cast::<u8>(),
+                MANDEL_REF_SLOTS * std::mem::size_of::<[f32; 2]>(),
+            );
+        }
+
         let u = Uniforms {
             w: self.w as u32,
             h: self.h as u32,
@@ -720,11 +972,7 @@ impl VisualEngine for MetalEngine {
             dt: ctx.dt,
             transition_alpha: alpha,
             beat_pulse: ctx.beat_pulse.clamp(0.0, 1.0),
-            fractal_zoom_mul: if self.fractal_zoom_enabled {
-                self.fractal_zoom_mode.multiplier() * self.fractal_zoom_drive
-            } else {
-                -1.0
-            },
+            fractal_zoom_mul: zoom_mul,
             rms: ctx.audio.rms,
             onset: ctx.audio.onset,
             centroid: ctx.audio.centroid,
@@ -732,10 +980,25 @@ impl VisualEngine for MetalEngine {
             bands: ctx.audio.bands,
             seed,
             safe: if ctx.safe { 1 } else { 0 },
-            quality: Self::quality_u32(quality),
+            quality: quality_u32,
             has_prev: if self.has_prev { 1 } else { 0 },
             camera_path_mode: self.camera_path_mode as u32,
             camera_path_speed: self.camera_path_speed,
+            active_ref_offset,
+            active_ref_len,
+            active_ref_enabled: if active_params.enabled && active_ref_len > 64 { 1 } else { 0 },
+            next_ref_offset,
+            next_ref_len,
+            next_ref_enabled: if next_params.enabled && next_ref_len > 64 { 1 } else { 0 },
+            _ref_pad0: [0; 2],
+            active_ref_cx: active_params.cx,
+            active_ref_cy: active_params.cy,
+            active_ref_scale: active_params.scale,
+            active_ref_depth: active_params.depth,
+            next_ref_cx: next_params.cx,
+            next_ref_cy: next_params.cy,
+            next_ref_scale: next_params.scale,
+            next_ref_depth: next_params.depth,
         };
 
         unsafe {
@@ -761,6 +1024,7 @@ impl VisualEngine for MetalEngine {
             encoder.set_texture(1, Some(out));
             encoder.set_sampler_state(0, Some(&self.sampler));
             encoder.set_buffer(0, Some(&self.uniforms), 0);
+            encoder.set_buffer(1, Some(&self.mandel_orbits), 0);
 
             let tpg = MTLSize::new(self.w as u64, self.h as u64, 1);
             let tptg = MTLSize::new(16, 16, 1);
@@ -967,6 +1231,24 @@ struct Uniforms {
     uint has_prev;
     uint camera_path_mode;
     float camera_path_speed;
+
+    uint active_ref_offset;
+    uint active_ref_len;
+    uint active_ref_enabled;
+    uint next_ref_offset;
+    uint next_ref_len;
+    uint next_ref_enabled;
+    uint _ref_pad0;
+    uint _ref_pad1;
+
+    float active_ref_cx;
+    float active_ref_cy;
+    float active_ref_scale;
+    float active_ref_depth;
+    float next_ref_cx;
+    float next_ref_cy;
+    float next_ref_scale;
+    float next_ref_depth;
 };
 
 static inline float3 pal(float t, float3 a, float3 b, float3 c, float3 d) {
@@ -1086,6 +1368,11 @@ static inline bool is_camera_travel_preset(uint preset) {
     uint p = preset % 56u;
     return (p == 2u) || (p == 3u) || (p == 11u) || (p == 20u) || (p == 21u) ||
            (p >= 38u && p <= 45u) || (p == 49u) || (p == 50u) || (p == 54u) || (p == 55u);
+}
+
+static inline bool is_mandelbrot_family_preset(uint preset) {
+    uint p = preset % 56u;
+    return (p == 2u) || (p == 38u) || (p == 40u) || (p == 41u);
 }
 
 // 0=auto, 1=orbit, 2=dolly, 3=helix, 4=spiral, 5=drift
@@ -1305,6 +1592,125 @@ static inline float sphere_trace_scene(float3 ro, float3 rd, float t, float bass
     return exp(-0.22 * dist);
 }
 
+static inline float3 mandelbrot_ref_color(
+    uint preset,
+    float2 p,
+    float t,
+    float bass,
+    float mid,
+    float treb,
+    float beat,
+    uint quality,
+    uint ref_offset,
+    uint ref_len,
+    float ref_scale,
+    float ref_depth,
+    constant float2* ref_orbits
+) {
+    if (ref_len < 3u) {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    int q = int(quality);
+    int base_iters = 48;
+    switch (preset % 56u) {
+        case 2u:  base_iters = 42 + q * 30; break;
+        case 38u: base_iters = 44 + q * 32; break;
+        case 40u: base_iters = 42 + q * 56; break;
+        case 41u: base_iters = 40 + q * 54; break;
+        default: base_iters = 40 + q * 30; break;
+    }
+    int ramp = int(clamp(ref_depth, 0.0, 48.0) * (7.0 + 2.5 * (float)q));
+    int iters = min((int)ref_len - 1, base_iters + ramp);
+    iters = max(iters, 24);
+
+    float bailout = ((preset % 56u) == 2u || (preset % 56u) == 38u) ? 64.0 : 256.0;
+    float2 trap_center = ((preset % 56u) == 41u) ? float2(0.15, 0.02) : float2(0.18, 0.05);
+    float s = max(abs(ref_scale), 1e-20);
+    float2 dc = p * s;
+
+    constant float2* orbit = ref_orbits + ref_offset;
+    float2 dz = float2(0.0);
+    float nu = (float)iters;
+    bool esc = false;
+    float trap = 1e9;
+    float m2 = 0.0;
+
+    for (int i = 0; i < iters; i++) {
+        float2 zn = orbit[i];
+        float2 dz2 = float2(dz.x*dz.x - dz.y*dz.y, 2.0*dz.x*dz.y);
+        float2 twozn_dz = float2(
+            2.0 * (zn.x*dz.x - zn.y*dz.y),
+            2.0 * (zn.x*dz.y + zn.y*dz.x)
+        );
+        float2 dz_next = twozn_dz + dz2 + dc;
+        float2 z_est = orbit[i + 1] + dz_next;
+        m2 = dot(z_est, z_est);
+        trap = min(trap, length(z_est - trap_center));
+        if (m2 > bailout) {
+            nu = (float)(i + 1) + 1.0 - log2(max(log2(max(m2, 1.0001)), 1e-6));
+            esc = true;
+            break;
+        }
+        dz = dz_next;
+    }
+
+    if (!esc) {
+        float iv = clamp(exp(-6.2 * trap), 0.0, 1.0);
+        iv = 0.15 + 0.85 * iv;
+        if ((preset % 56u) == 41u) {
+            return pal(
+                iv + 0.07*t + 0.10*mid,
+                float3(0.08,0.10,0.16),
+                float3(0.82,0.82,0.92),
+                float3(1.0,1.0,1.0),
+                float3(0.10,0.30,0.60)
+            ) * iv;
+        }
+        return pal(
+            iv + 0.08*t + 0.10*bass,
+            float3(0.08,0.07,0.16),
+            float3(0.80,0.78,0.92),
+            float3(1.0,1.0,1.0),
+            float3(0.0,0.22,0.52)
+        ) * iv;
+    }
+
+    float n = clamp(nu / max((float)iters, 1.0), 0.0, 1.0);
+    float stripe = 0.5 + 0.5 * sin(nu * (0.10 + 0.06*treb) + t * (0.8 + 1.4*beat));
+    if ((preset % 56u) == 41u) {
+        stripe = 0.5 + 0.5 * sin(nu * (0.14 + 0.04*treb) - t * (0.9 + 1.2*beat));
+    }
+    float depth_mod = clamp(1.0 + 0.022 * clamp(ref_depth, 0.0, 40.0), 1.0, 1.7);
+    float v = clamp((pow(1.0 - n, 0.33) * 0.72 + stripe * 0.28) * depth_mod, 0.0, 1.0);
+
+    if ((preset % 56u) == 41u) {
+        return pal(
+            v + 0.08*t + 0.10*mid,
+            float3(0.08,0.12,0.18),
+            float3(0.92,0.88,0.95),
+            float3(1.0,1.0,1.0),
+            float3(0.10,0.35,0.65)
+        );
+    }
+    if ((preset % 56u) == 2u || (preset % 56u) == 38u) {
+        return pal(
+            v + 0.07*t + 0.25*bass,
+            float3(0.10,0.08,0.18),
+            float3(0.90,0.85,0.98),
+            float3(1.0,1.0,1.0),
+            float3(0.0,0.25,0.5)
+        );
+    }
+    return pal(
+        v + 0.10*t + 0.12*bass,
+        float3(0.12,0.09,0.20),
+        float3(0.90,0.85,0.98),
+        float3(1.0,1.0,1.0),
+        float3(0.0,0.25,0.5)
+    );
+}
+
 static inline float3 preset_color(uint preset, float2 p, float t, float bass, float mid, float treb, float beat, uint quality, float aspect, float zoom_mul) {
     // p: aspect-corrected (-aspect..aspect, -1..1)
     float r = length(p);
@@ -1333,18 +1739,38 @@ static inline float3 preset_color(uint preset, float2 p, float t, float bass, fl
         case 2u: {
             // Mandelbrot-ish
             float zf = fractal_motion_zoom(t, zoom_mul, bass, beat);
-            float2 c = float2((p.x*0.9)/zf - 0.25 + 0.08*sin(t*0.3 + bass*2.0), (p.y*0.9)/zf + 0.05*cos(t*0.2 + mid*2.0));
+            float sc = 1.9 / max(zf, 1e-6);
+            float drift = sc * (0.12 + 0.25*bass + 0.10*beat);
+            float2 c = float2(-0.743643887, 0.131825904);
+            c += p * sc;
+            c += float2(
+                drift * sin(t*0.24 + bass*1.6),
+                drift * cos(t*0.19 + mid*1.4)
+            );
             float2 z = float2(0.0);
-            int iters = 28 + int(q)*18;
-            int i = 0;
-            for (; i < iters; i++) {
+            int iters = 42 + int(q)*30;
+            float nu = (float)iters;
+            bool esc = false;
+            float trap = 1e9;
+            for (int i = 0; i < iters; i++) {
                 z = float2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
-                if (dot(z,z) > 4.0) break;
+                float m2 = dot(z,z);
+                trap = min(trap, length(z - float2(0.18, 0.05)));
+                if (m2 > 64.0) {
+                    nu = (float)i + 1.0 - log2(max(log2(max(m2, 1.0001)), 1e-6));
+                    esc = true;
+                    break;
+                }
             }
-            float m = (float)i / (float)iters;
-            float glow = exp(-3.5 * m);
-            float3 col = pal(m + 0.08*t + 0.2*bass, float3(0.15,0.10,0.25), float3(0.75,0.70,0.95), float3(1.0,1.0,1.0), float3(0.0,0.25,0.5));
-            return col + glow*0.35;
+            if (!esc) {
+                float iv = clamp(exp(-6.2*trap), 0.0, 1.0);
+                iv = 0.16 + 0.84*iv;
+                return pal(iv + 0.08*t + 0.12*bass, float3(0.10,0.08,0.18), float3(0.88,0.84,0.98), float3(1.0,1.0,1.0), float3(0.0,0.25,0.5)) * iv;
+            }
+            float n = clamp(nu / (float)iters, 0.0, 1.0);
+            float stripe = 0.5 + 0.5*sin(nu*(0.11 + 0.05*treb) + t*(0.7 + 1.2*beat));
+            float v = clamp(pow(1.0 - n, 0.34)*0.70 + stripe*0.30, 0.0, 1.0);
+            return pal(v + 0.08*t + 0.25*bass, float3(0.10,0.08,0.18), float3(0.90,0.85,0.98), float3(1.0,1.0,1.0), float3(0.0,0.25,0.5));
         }
         case 3u: {
             // Julia
@@ -1690,18 +2116,38 @@ static inline float3 preset_color(uint preset, float2 p, float t, float bass, fl
         case 38u: {
             // Deep mandelbrot zoom-ish
             float zf = fractal_motion_zoom(t, zoom_mul, bass, beat);
-            float2 c = float2((p.x*0.75)/zf - 0.5 + 0.05*sin(t*0.2 + bass*2.0), (p.y*0.75)/zf + 0.02*cos(t*0.17 + mid*2.0));
+            float sc = 1.75 / max(zf, 1e-6);
+            float drift = sc * (0.11 + 0.22*bass + 0.10*beat);
+            float2 c = float2(-0.761574, -0.0847596);
+            c += p * sc;
+            c += float2(
+                drift * sin(t*0.22 + bass*1.5),
+                drift * cos(t*0.18 + mid*1.3)
+            );
             float2 z = float2(0.0);
-            int iters = 34 + int(q)*22;
-            int i = 0;
-            for (; i < iters; i++) {
+            int iters = 44 + int(q)*32;
+            float nu = (float)iters;
+            bool esc = false;
+            float trap = 1e9;
+            for (int i = 0; i < iters; i++) {
                 z = float2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
-                if (dot(z,z) > 4.0) break;
+                float m2 = dot(z,z);
+                trap = min(trap, length(z - float2(0.18, 0.05)));
+                if (m2 > 64.0) {
+                    nu = (float)i + 1.0 - log2(max(log2(max(m2, 1.0001)), 1e-6));
+                    esc = true;
+                    break;
+                }
             }
-            float m = (float)i / (float)iters;
-            float glow = exp(-4.0*m);
-            float3 col = pal(m + 0.07*t + 0.25*bass, float3(0.10,0.08,0.18), float3(0.90,0.85,0.98), float3(1.0,1.0,1.0), float3(0.0,0.25,0.5));
-            return col + glow*0.28;
+            if (!esc) {
+                float iv = clamp(exp(-6.2*trap), 0.0, 1.0);
+                iv = 0.16 + 0.84*iv;
+                return pal(iv + 0.07*t + 0.20*bass, float3(0.10,0.08,0.18), float3(0.90,0.85,0.98), float3(1.0,1.0,1.0), float3(0.0,0.25,0.5)) * iv;
+            }
+            float n = clamp(nu / (float)iters, 0.0, 1.0);
+            float stripe = 0.5 + 0.5*sin(nu*(0.12 + 0.05*treb) + t*(0.8 + 1.3*beat));
+            float v = clamp(pow(1.0 - n, 0.32)*0.70 + stripe*0.30, 0.0, 1.0);
+            return pal(v + 0.08*t + 0.24*bass, float3(0.10,0.08,0.18), float3(0.90,0.85,0.98), float3(1.0,1.0,1.0), float3(0.0,0.25,0.5));
         }
         case 39u: {
             // Neon rings v2
@@ -1718,13 +2164,10 @@ static inline float3 preset_color(uint preset, float2 p, float t, float bass, fl
             float zoom = exp2(zpow);
             float sc = 1.9 / max(zoom, 1.0);
             float2 c0 = float2(-0.743643887, 0.131825904);
-            float2 c = c0 + float2(
-                sin(t*(0.17 + 0.12*mid)),
-                cos(t*(0.13 + 0.10*treb))
-            ) * (sc * (40.0 + 40.0*treb));
+            float2 c = c0;
             c += p * sc;
             float2 z = float2(0.0);
-            int iters = 38 + int(q)*52;
+            int iters = 42 + int(q)*56;
             float nu = (float)iters;
             bool esc = false;
             float trap = 1e9;
@@ -1755,13 +2198,9 @@ static inline float3 preset_color(uint preset, float2 p, float t, float bass, fl
             float zoom = exp2(zpow);
             float sc = 1.8 / max(zoom, 1.0);
             float2 c = float2(-0.7453, 0.1127);
-            c += float2(
-                sin(t*(0.19 + 0.10*mid)),
-                cos(t*(0.15 + 0.10*treb))
-            ) * (sc * (46.0 + 34.0*treb));
             c += p * sc;
             float2 z = float2(0.0);
-            int iters = 36 + int(q)*50;
+            int iters = 40 + int(q)*54;
             float nu = (float)iters;
             bool esc = false;
             float trap = 1e9;
@@ -2113,6 +2552,7 @@ kernel void visualize(
     texture2d<half, access::write> outTex [[texture(1)]],
     sampler s [[sampler(0)]],
     constant Uniforms& u [[buffer(0)]],
+    constant float2* mandel_orbits [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= u.w || gid.y >= u.h) return;
@@ -2151,8 +2591,14 @@ kernel void visualize(
 
     float2 q0 = q;
     float2 q1 = q;
-    bool travel0 = (u.fractal_zoom_mul > 0.0) && is_camera_travel_preset(u.active_preset);
-    bool travel1 = (u.fractal_zoom_mul > 0.0) && is_camera_travel_preset(u.next_preset);
+    bool travel0 =
+        (u.fractal_zoom_mul > 0.0) &&
+        is_camera_travel_preset(u.active_preset) &&
+        !is_mandelbrot_family_preset(u.active_preset);
+    bool travel1 =
+        (u.fractal_zoom_mul > 0.0) &&
+        is_camera_travel_preset(u.next_preset) &&
+        !is_mandelbrot_family_preset(u.next_preset);
     if (travel0 || (alpha > 0.001 && travel1)) {
         uint mode_override = min(u.camera_path_mode, 5u);
         uint mode0 = (mode_override == 0u) ? camera_path_mode_for_preset(u.active_preset) : mode_override;
@@ -2242,8 +2688,49 @@ kernel void visualize(
         q1 += float2(0.0, cos(p.x*20.0 - t*11.0)) * smear;
     }
 
-    float3 c0 = preset_color(u.active_preset, q0, t, bass, mid, treb, beat, u.quality, aspect, u.fractal_zoom_mul);
-    float3 c1 = preset_color(u.next_preset, q1, t, bass, mid, treb, beat, u.quality, aspect, u.fractal_zoom_mul);
+    bool active_ref_ok =
+        is_mandelbrot_family_preset(u.active_preset) &&
+        (u.active_ref_enabled != 0u) &&
+        (u.active_ref_len > 32u);
+    bool next_ref_ok =
+        is_mandelbrot_family_preset(u.next_preset) &&
+        (u.next_ref_enabled != 0u) &&
+        (u.next_ref_len > 32u);
+
+    float3 c0 = active_ref_ok
+        ? mandelbrot_ref_color(
+            u.active_preset,
+            q0,
+            t,
+            bass,
+            mid,
+            treb,
+            beat,
+            u.quality,
+            u.active_ref_offset,
+            u.active_ref_len,
+            u.active_ref_scale,
+            u.active_ref_depth,
+            mandel_orbits
+        )
+        : preset_color(u.active_preset, q0, t, bass, mid, treb, beat, u.quality, aspect, u.fractal_zoom_mul);
+    float3 c1 = next_ref_ok
+        ? mandelbrot_ref_color(
+            u.next_preset,
+            q1,
+            t,
+            bass,
+            mid,
+            treb,
+            beat,
+            u.quality,
+            u.next_ref_offset,
+            u.next_ref_len,
+            u.next_ref_scale,
+            u.next_ref_depth,
+            mandel_orbits
+        )
+        : preset_color(u.next_preset, q1, t, bass, mid, treb, beat, u.quality, aspect, u.fractal_zoom_mul);
     float mix_alpha = alpha;
     if (u.transition_kind == 3u) {
         // Radial/ripple wipe from center.

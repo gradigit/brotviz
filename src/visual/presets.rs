@@ -31,7 +31,9 @@ pub fn make_presets() -> Vec<Box<dyn Preset>> {
 
     v.push(Box::new(FieldPreset::new(
         "Mandelbrot: Bass Zoom",
-        Mandelbrot { center: (-0.65, 0.0) },
+        Mandelbrot {
+            center: (-0.743_643_9, 0.131_825_91),
+        },
         Prism,
         Feedback::tunnel(0.88, 0.018, 1.5),
     )));
@@ -280,7 +282,7 @@ pub fn make_presets() -> Vec<Box<dyn Preset>> {
         "Mandelbrot: Infinite Dive",
         MandelDeep {
             center: (-0.7436439, 0.13182591),
-            orbit: (0.52, 0.38),
+            orbit: (0.34, 0.28),
             speed: 0.92,
         },
         Prism,
@@ -290,7 +292,7 @@ pub fn make_presets() -> Vec<Box<dyn Preset>> {
         "Mandelbrot: Seahorse Zoom",
         MandelDeep {
             center: (-0.7453, 0.1127),
-            orbit: (0.70, 0.46),
+            orbit: (0.32, 0.26),
             speed: 0.86,
         },
         Cosmic,
@@ -299,9 +301,9 @@ pub fn make_presets() -> Vec<Box<dyn Preset>> {
     v.push(Box::new(FieldPreset::new(
         "Mandelbrot: Spiral Probe",
         MandelDeep {
-            center: (-0.1011, 0.9563),
-            orbit: (0.58, 0.62),
-            speed: 0.84,
+            center: (-0.761_574, -0.084_759_6),
+            orbit: (0.36, 0.32),
+            speed: 0.82,
         },
         Neon,
         Feedback::tunnel(0.90, 0.020, 1.32),
@@ -614,12 +616,15 @@ impl Preset for FieldPreset {
                         let fz =
                             fractal_zoom_motion(t, ctx.fractal_zoom_mul, bass, mid, treb, beat_pulse, onset);
                         let zoom = 1.7 * zoom_mod * fz;
+                        let drift = (0.10 + 0.25 * bass + 0.10 * beat_pulse)
+                            / zoom.max(1.0)
+                            * (1.0 + 0.4 * onset);
                         fractal_mandelbrot(
                             fx,
                             fy,
                             t,
-                            center.0 + 0.04 * (t * 0.3).sin(),
-                            center.1 + 0.03 * (t * 0.23).cos(),
+                            center.0 + drift * (t * 0.24).sin(),
+                            center.1 + drift * (t * 0.19).cos(),
                             zoom,
                             ctx.quality,
                         )
@@ -878,23 +883,39 @@ fn fractal_mandelbrot(
     };
 
     let scale = 1.25 / zoom;
-    let cr = cx + x * scale + 0.02 * (t * 0.15).sin();
-    let ci = cy + y * scale + 0.02 * (t * 0.12).cos();
+    let drift = scale * 0.18;
+    let cr = cx + x * scale + drift * (t * 0.15).sin();
+    let ci = cy + y * scale + drift * (t * 0.12).cos();
 
     let mut zr = 0.0f32;
     let mut zi = 0.0f32;
     let mut i = 0u32;
+    let mut m2 = 0.0f32;
+    let mut trap = 1e9f32;
     while i < max_iter {
         let zr2 = zr * zr - zi * zi + cr;
         zi = 2.0 * zr * zi + ci;
         zr = zr2;
-        if zr * zr + zi * zi > bail {
+        m2 = zr * zr + zi * zi;
+        let dx = zr - 0.18;
+        let dy = zi - 0.05;
+        let d = (dx * dx + dy * dy).sqrt();
+        if d < trap {
+            trap = d;
+        }
+        if m2 > bail {
             break;
         }
         i += 1;
     }
-
-    (i as f32 / max_iter as f32).sqrt()
+    if i >= max_iter {
+        let iv = (-6.2 * trap).exp().clamp(0.0, 1.0);
+        return (0.14 + 0.86 * iv).clamp(0.0, 1.0);
+    }
+    let nu = i as f32 + 1.0 - (m2.max(1.0001).ln().ln() / std::f32::consts::LN_2);
+    let n = (nu / max_iter as f32).clamp(0.0, 1.0);
+    let stripe = ((nu * 0.11) + t * 0.8).sin() * 0.5 + 0.5;
+    ((1.0 - n).powf(0.34) * 0.72 + stripe * 0.28).clamp(0.0, 1.0)
 }
 
 #[inline]
@@ -954,10 +975,10 @@ fn fractal_motion_xy(
     let rate = (0.095 + 0.10 * drive).max(0.01) * zm * (1.0 + 0.32 * transient);
     let lz = (1.0 + t.max(0.0) * rate).log2();
     let zcam = 1.0 + (1.06 + 1.42 * zm) * lz * (1.0 + 0.12 * drive);
-    let drift_gain = (1.0 + (0.40 + 0.26 * drive) * lz).clamp(1.0, 6.0);
+    let drift_gain = (1.0 + (0.24 + 0.14 * drive) * lz).clamp(1.0, 2.4);
     let phase = 0.55 * mid + 0.45 * treb;
-    let dx = 0.072 * drift_gain * (t * (0.40 + 0.07 * drive) + 0.75 * phase + 0.85 * transient).sin();
-    let dy = 0.072 * drift_gain * (t * (0.35 + 0.08 * drive) + 0.70 * phase - 0.62 * transient).cos();
+    let dx = 0.028 * drift_gain * (t * (0.40 + 0.07 * drive) + 0.75 * phase + 0.85 * transient).sin();
+    let dy = 0.028 * drift_gain * (t * (0.35 + 0.08 * drive) + 0.70 * phase - 0.62 * transient).cos();
     ((x + dx) / zcam, (y + dy) / zcam)
 }
 
@@ -984,17 +1005,17 @@ fn deep_zoom_power(
 
 #[derive(Clone, Copy)]
 struct DeepCamera {
-    zoom: f32,
-    scale: f32,
-    cx: f32,
-    cy: f32,
-    perturb: (f32, f32),
+    zoom: f64,
+    scale: f64,
+    cx: f64,
+    cy: f64,
+    perturb: (f64, f64),
     detail: f32,
 }
 
 #[inline]
-fn rebased_coord(anchor: f32, drift: f32, scale: f32) -> f32 {
-    let step = (scale.abs() * 18.0).max(1e-8);
+fn rebased_coord(anchor: f64, drift: f64, scale: f64) -> f64 {
+    let step = (scale.abs() * 18.0).max(1e-14);
     let world = anchor + drift;
     let rebased = (world / step).round() * step;
     let local = (world - rebased).clamp(-step * 0.45, step * 0.45);
@@ -1022,22 +1043,31 @@ fn deep_camera_rebased(
     let transient = smoothed_transient_drive(beat, onset);
     let detail = (detail_hint + 0.18 * drive + 0.22 * treb).clamp(0.0, 1.0);
     let power = deep_zoom_power(t, speed, zoom_mul, beat, drive, base, span);
-    let zoom = 2.0f32.powf(power);
-    let scale = base_scale / zoom.max(1.0);
+    let zoom = 2.0f64.powf(power as f64);
+    let precision_floor = f64::EPSILON
+        * ((center.0 as f64).abs().max((center.1 as f64).abs()).max(1.0))
+        * 96.0;
+    let scale = ((base_scale as f64) / zoom.max(1.0)).max(precision_floor);
 
     let orbit_gain = orbit_drive.clamp(0.1, 1.8);
-    let orbit_scale = scale * (24.0 + 56.0 * (0.25 + detail)) * orbit_gain;
-    let ox = orbit.0 * (t * (0.11 + 0.08 * mid + 0.05 * speed.max(0.0)) + 1.5 * transient).sin() * orbit_scale;
-    let oy = orbit.1 * (t * (0.09 + 0.07 * treb + 0.04 * speed.max(0.0)) - 1.2 * transient).cos() * orbit_scale;
+    let orbit_scale = scale * (0.08 + 0.22 * detail) as f64 * orbit_gain as f64;
+    let ox = orbit.0 as f64
+        * (t as f64 * (0.11 + 0.08 * mid + 0.05 * speed.max(0.0)) as f64 + 1.5 * transient as f64)
+            .sin()
+        * orbit_scale;
+    let oy = orbit.1 as f64
+        * (t as f64 * (0.09 + 0.07 * treb + 0.04 * speed.max(0.0)) as f64 - 1.2 * transient as f64)
+            .cos()
+        * orbit_scale;
 
-    let cx = rebased_coord(center.0, ox, scale);
-    let cy = rebased_coord(center.1, oy, scale);
+    let cx = rebased_coord(center.0 as f64, ox, scale);
+    let cy = rebased_coord(center.1 as f64, oy, scale);
 
-    let p_amp = scale * (0.08 + 0.34 * detail);
-    let p_phase = t * (0.92 + 0.45 * drive + 0.35 * speed.max(0.0));
+    let p_amp = scale * (0.03 + 0.09 * detail) as f64;
+    let p_phase = t as f64 * (0.92 + 0.45 * drive + 0.35 * speed.max(0.0)) as f64;
     let perturb = (
-        p_amp * (p_phase + center.0 * 19.0 + beat * 2.3).sin(),
-        p_amp * (p_phase * 0.83 + center.1 * 17.0 - onset * 1.9).cos(),
+        p_amp * (p_phase + center.0 as f64 * 19.0 + beat as f64 * 2.3).sin(),
+        p_amp * (p_phase * 0.83 + center.1 as f64 * 17.0 - onset as f64 * 1.9).cos(),
     );
 
     DeepCamera {
@@ -1051,7 +1081,7 @@ fn deep_camera_rebased(
 }
 
 #[inline]
-fn deep_detail_mod(nu: f32, x: f32, y: f32, t: f32, zoom: f32, detail: f32, beat: f32, seed: u32) -> f32 {
+fn deep_detail_mod(nu: f32, x: f32, y: f32, t: f32, zoom: f64, detail: f32, beat: f32, seed: u32) -> f32 {
     let noise = hash_noise(
         x * (44.0 + 72.0 * detail) + t * 0.31,
         y * (48.0 + 66.0 * detail) - t * 0.27,
@@ -1059,8 +1089,20 @@ fn deep_detail_mod(nu: f32, x: f32, y: f32, t: f32, zoom: f32, detail: f32, beat
     );
     let filigree = ((nu * (0.11 + 0.16 * detail)) + (x * 2.7 - y * 2.1) + t * (0.9 + 1.5 * beat)).sin() * 0.5
         + 0.5;
-    let depth_boost = (zoom.log2().max(1.0) * 0.015 * (0.4 + detail)).clamp(0.0, 0.24);
+    let depth_boost = ((zoom.log2().max(1.0) as f32) * 0.015 * (0.4 + detail)).clamp(0.0, 0.24);
     ((0.74 + 0.26 * filigree) * (0.86 + 0.22 * noise) + depth_boost).clamp(0.62, 1.35)
+}
+
+#[inline]
+fn deep_iter_ramp(zoom: f64, quality: Quality) -> u32 {
+    let depth = zoom.log2().max(0.0);
+    let q = match quality {
+        Quality::Ultra => 2.2,
+        Quality::High => 1.8,
+        Quality::Balanced => 1.4,
+        Quality::Fast => 1.0,
+    };
+    (depth * q * 9.5).clamp(0.0, 520.0) as u32
 }
 
 fn fractal_julia(
@@ -1118,8 +1160,6 @@ fn fractal_mandelbrot_deep(
         Quality::Balanced => 144u32,
         Quality::Fast => 96u32,
     };
-    let max_iter = ((max_iter_base as f32) * (1.0 + 0.25 * detail.clamp(0.0, 1.0))) as u32;
-
     let cam = deep_camera_rebased(
         t,
         center,
@@ -1137,28 +1177,43 @@ fn fractal_mandelbrot_deep(
         orbit_drive,
         detail,
     );
-    let cr = cam.cx + (x + cam.perturb.0) * cam.scale;
-    let ci = cam.cy + (y + cam.perturb.1) * cam.scale;
+    let max_iter = (((max_iter_base as f32) * (1.0 + 0.25 * detail.clamp(0.0, 1.0))) as u32)
+        .saturating_add(deep_iter_ramp(cam.zoom, quality));
+    let cr = cam.cx + (x as f64 + cam.perturb.0) * cam.scale;
+    let ci = cam.cy + (y as f64 + cam.perturb.1) * cam.scale;
 
-    let mut zr = 0.0f32;
-    let mut zi = 0.0f32;
+    let mut zr = 0.0f64;
+    let mut zi = 0.0f64;
     let mut i = 0u32;
-    let mut m2 = 0.0f32;
+    let mut m2 = 0.0f64;
+    let mut trap = 1e12f64;
     while i < max_iter {
         let zr2 = zr * zr - zi * zi + cr;
         zi = 2.0 * zr * zi + ci;
         zr = zr2;
         m2 = zr * zr + zi * zi;
+        let dx1 = zr - 0.18;
+        let dy1 = zi - 0.05;
+        let d1 = (dx1 * dx1 + dy1 * dy1).sqrt();
+        let dx2 = zr - 0.15;
+        let dy2 = zi - 0.02;
+        let d2 = (dx2 * dx2 + dy2 * dy2).sqrt();
+        let d = d1.min(d2);
+        if d < trap {
+            trap = d;
+        }
         if m2 > 256.0 {
             break;
         }
         i += 1;
     }
     if i >= max_iter {
-        return 0.0;
+        let iv = (-6.0 * trap as f32).exp().clamp(0.0, 1.0);
+        let grain = ((x * 92.0 - y * 84.0) + t * (0.7 + 1.0 * beat)).sin() * 0.5 + 0.5;
+        return (0.12 + 0.74 * iv + 0.14 * grain).clamp(0.0, 1.0);
     }
 
-    let nu = i as f32 + 1.0 - (m2.max(1.0001).ln().ln() / std::f32::consts::LN_2);
+    let nu = i as f32 + 1.0 - ((m2.max(1.0001).ln().ln() / std::f64::consts::LN_2) as f32);
     let n = (nu / max_iter as f32).clamp(0.0, 1.0);
     let stripe = ((nu * (0.10 + 0.06 * treb)) + t * (0.8 + 1.4 * beat)).sin() * 0.5 + 0.5;
     let detail_mod = deep_detail_mod(nu, x, y, t, cam.zoom, cam.detail, beat, 0xA9E3_1F52);
@@ -1187,8 +1242,6 @@ fn fractal_julia_deep(
         Quality::Balanced => 132u32,
         Quality::Fast => 88u32,
     };
-    let max_iter = ((max_iter_base as f32) * (1.0 + 0.22 * detail.clamp(0.0, 1.0))) as u32;
-
     let cam = deep_camera_rebased(
         t,
         (0.0, 0.0),
@@ -1206,23 +1259,29 @@ fn fractal_julia_deep(
         orbit_drive,
         detail,
     );
+    let max_iter = (((max_iter_base as f32) * (1.0 + 0.22 * detail.clamp(0.0, 1.0))) as u32)
+        .saturating_add(deep_iter_ramp(cam.zoom, quality));
 
-    let c_scale = cam.scale * (24.0 + 36.0 * cam.detail) * orbit_drive.clamp(0.2, 1.8);
+    let c_scale = cam.scale * (24.0 + 36.0 * cam.detail) as f64 * orbit_drive.clamp(0.2, 1.8) as f64;
     let cx = rebased_coord(
-        c_base.0,
-        0.16 * (t * (0.21 + treb * 0.25)).cos() + bass * 0.05 + c_scale * (t * (0.17 + 0.08 * mid)).sin(),
+        c_base.0 as f64,
+        0.16 * (t * (0.21 + treb * 0.25)).cos() as f64
+            + bass as f64 * 0.05
+            + c_scale * (t * (0.17 + 0.08 * mid)).sin() as f64,
         cam.scale,
     );
     let cy = rebased_coord(
-        c_base.1,
-        0.15 * (t * (0.19 + bass * 0.22)).sin() - treb * 0.04 + c_scale * (t * (0.13 + 0.09 * treb)).cos(),
+        c_base.1 as f64,
+        0.15 * (t * (0.19 + bass * 0.22)).sin() as f64
+            - treb as f64 * 0.04
+            + c_scale * (t * (0.13 + 0.09 * treb)).cos() as f64,
         cam.scale,
     );
 
-    let mut zr = cam.cx + (x + cam.perturb.0) * cam.scale;
-    let mut zi = cam.cy + (y + cam.perturb.1) * cam.scale;
+    let mut zr = cam.cx + (x as f64 + cam.perturb.0) * cam.scale;
+    let mut zi = cam.cy + (y as f64 + cam.perturb.1) * cam.scale;
     let mut i = 0u32;
-    let mut m2 = 0.0f32;
+    let mut m2 = 0.0f64;
     while i < max_iter {
         let zr2 = zr * zr - zi * zi + cx;
         zi = 2.0 * zr * zi + cy;
@@ -1237,7 +1296,7 @@ fn fractal_julia_deep(
         return 0.0;
     }
 
-    let nu = i as f32 + 1.0 - (m2.max(1.0001).ln().ln() / std::f32::consts::LN_2);
+    let nu = i as f32 + 1.0 - ((m2.max(1.0001).ln().ln() / std::f64::consts::LN_2) as f32);
     let n = (nu / max_iter as f32).clamp(0.0, 1.0);
     let stripe = ((nu * (0.12 + 0.05 * treb)) - t * (0.9 + 1.2 * beat)).sin() * 0.5 + 0.5;
     let detail_mod = deep_detail_mod(nu, x, y, t, cam.zoom, cam.detail, beat, 0xC31D_2A91);
@@ -1304,8 +1363,6 @@ fn fractal_burning_ship_deep(
         Quality::Balanced => 144u32,
         Quality::Fast => 96u32,
     };
-    let max_iter = ((max_iter_base as f32) * (1.0 + 0.20 * detail.clamp(0.0, 1.0))) as u32;
-
     let orbit = (0.52 + 0.24 * bass, 0.44 + 0.20 * treb);
     let cam = deep_camera_rebased(
         t,
@@ -1324,13 +1381,15 @@ fn fractal_burning_ship_deep(
         orbit_drive,
         detail,
     );
-    let cr = cam.cx + (x + cam.perturb.0) * cam.scale;
-    let ci = cam.cy + (y + cam.perturb.1) * cam.scale;
+    let max_iter = (((max_iter_base as f32) * (1.0 + 0.20 * detail.clamp(0.0, 1.0))) as u32)
+        .saturating_add(deep_iter_ramp(cam.zoom, quality));
+    let cr = cam.cx + (x as f64 + cam.perturb.0) * cam.scale;
+    let ci = cam.cy + (y as f64 + cam.perturb.1) * cam.scale;
 
-    let mut zr = 0.0f32;
-    let mut zi = 0.0f32;
+    let mut zr = 0.0f64;
+    let mut zi = 0.0f64;
     let mut i = 0u32;
-    let mut m2 = 0.0f32;
+    let mut m2 = 0.0f64;
     while i < max_iter {
         zr = zr.abs();
         zi = zi.abs();
@@ -1347,7 +1406,7 @@ fn fractal_burning_ship_deep(
         return 0.0;
     }
 
-    let nu = i as f32 + 1.0 - (m2.max(1.0001).ln().ln() / std::f32::consts::LN_2);
+    let nu = i as f32 + 1.0 - ((m2.max(1.0001).ln().ln() / std::f64::consts::LN_2) as f32);
     let n = (nu / max_iter as f32).clamp(0.0, 1.0);
     let grain = ((x * 120.0 + y * 90.0 + t * (1.2 + 1.8 * beat)).sin() * 0.5 + 0.5) * 0.14;
     let detail_mod = deep_detail_mod(nu, x, y, t, cam.zoom, cam.detail, beat, 0x6F4A_73D2);
